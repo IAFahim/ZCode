@@ -126,6 +126,9 @@ export const commandPayloadSchemas = {
       automationId: z.string().min(1).optional(),
       offPeakTaskId: z.string().min(1).optional(),
       offPeakRunType: z.enum(["init", "resume"]).optional(),
+      // 配额守护自动续跑归属（docs/quota-watchdog/spec.md §3.3）：Host 侧 watchdog 派发的
+      // sendText 回退路径携带；与 automationId/offPeakTaskId 互斥，同属"非用户手动输入"身份。
+      resumeIntentId: z.string().min(1).optional(),
       // Bot 来源只由 Host 注入，用于 CronCreate 在当前 turn 内读取并持久化回推地址。
       botDeliveryTarget: zcodeAutomationBotDeliveryTargetSchema.optional(),
       inputOrigin: z.enum(["desktop", "mobile"]).optional(),
@@ -136,10 +139,15 @@ export const commandPayloadSchemas = {
       toolDisallowlist: z.array(z.string().min(1)).optional(),
     })
     .superRefine((payload, context) => {
-      if (payload.automationId && payload.offPeakTaskId) {
+      const attributionCount = [
+        payload.automationId,
+        payload.offPeakTaskId,
+        payload.resumeIntentId,
+      ].filter(Boolean).length;
+      if (attributionCount > 1) {
         context.addIssue({
           code: z.ZodIssueCode.custom,
-          message: "automationId and offPeakTaskId are mutually exclusive",
+          message: "automationId / offPeakTaskId / resumeIntentId are mutually exclusive",
         });
       }
       if (payload.offPeakRunType && !payload.offPeakTaskId) {
@@ -462,6 +470,9 @@ export const commandAckSchema = z.object({
   reasonCode: z.string().optional(),
   message: z.string().optional(),
   revisionAtDecision: z.number(),
+  // row-target 命令（retryTurn 等）的 proto.staleLogEpoch 裁决回传当前日志代际，
+  // host 侧无本地 v4 投影时据此收敛 baseLogEpoch 重试（additive；旧 CLI 缺省 = 不回传）。
+  logEpochAtDecision: z.string().optional(),
   // duplicate 回放缓存结果；accepted 亦可即时带（fork）。
   result: commandResultSchema.optional(),
 });

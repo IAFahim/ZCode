@@ -20,7 +20,7 @@ import { isCodingPlanModelProviderId } from "@zcode/shared";
 import type { ICredentialService } from "../credential/credential.js";
 import type { IAccountRequestAuthService } from "../model-provider/accountRequestAuthService.js";
 import type { IZCodeAgentService } from "../zcode-agent/zcodeAgent.js";
-import type { IUsageStatsService } from "./usageStats.js";
+import type { IUsageStatsAutoResumeDelegate, IUsageStatsService } from "./usageStats.js";
 import {
   BigModelUsageQuotaProvider,
   type UsageApiAuthorizationRequest,
@@ -46,6 +46,8 @@ interface UsageStatsServiceDependencies {
    * 缺省时 entitlement 快照不含 MCP 额度。
    */
   officialMcpCredentialSource?: OfficialMcpCredentialSource;
+  /** 配额守护委托（quotaWatchdogService）；缺省时自动续跑契约方法为 undefined。 */
+  autoResumeDelegate?: IUsageStatsAutoResumeDelegate;
 }
 
 const CODING_PLAN_REGULAR_TPS_CACHE_MS = 5 * 60_000;
@@ -67,6 +69,8 @@ export function createUsageStatsService(
       ? { officialMcpCredentialSource: dependencies.officialMcpCredentialSource }
       : {}),
   });
+  // 自动续跑契约委托：看门狗未装配（测试/独立构造）时保持 undefined，不伪造行为。
+  const autoResume = dependencies.autoResumeDelegate;
   const regularTpsCache = new Map<
     string,
     { expiresAt: number; value: number | undefined }
@@ -169,5 +173,13 @@ export function createUsageStatsService(
     ): Promise<UsageEntitlementSnapshot> {
       return quotaProvider.getSnapshotForRequest(request);
     },
+    ...(autoResume
+      ? {
+          reportAutoResumeFailure: autoResume.reportAutoResumeFailure.bind(autoResume),
+          cancelAutoResume: autoResume.cancelAutoResume.bind(autoResume),
+          getAutoResumeIntent: autoResume.getAutoResumeIntent.bind(autoResume),
+          getQuotaWatchdogStatus: autoResume.getQuotaWatchdogStatus.bind(autoResume),
+        }
+      : {}),
   };
 }

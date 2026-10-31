@@ -9,6 +9,8 @@
   "packages/desktop/test/clientScenesMockServer.test.ts",
   "packages/desktop/test/codeCommandRecorder.test.ts",
   "packages/desktop/test/codingPlanDataPlaneResponse.test.ts",
+  "packages/desktop/test/quotaWatchdogDomain.test.ts",
+  "packages/desktop/test/resumeIntentRepo.test.ts",
   "packages/desktop/test/codingPlanE2EMockEnv.test.ts",
   "packages/desktop/test/codingPlanUpgradeMockServer.test.ts",
   "packages/desktop/test/confirmedProcess.test.ts",

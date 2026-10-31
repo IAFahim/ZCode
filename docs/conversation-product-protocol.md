@@ -628,6 +628,25 @@ map。legacy workspace fork 可以保留原 checkpoint 策略，但 V4 入口不
 - UI 只消费 CLI `visibility/origin/marker/actions`。不得按数组位置、`lastFlowRow` 或 raw `/compact`
   文本隐藏 action/row；旧历史缺 canonical 字段时由 CLI hydration 归一化。
 
+### Host-Initiated Resume（自动续跑归属，2026-10-30 增补）
+
+「配额守护与自动续跑」（[docs/quota-watchdog/spec.md](./quota-watchdog/spec.md)）允许 Host
+侧在 turn 失败（额度耗尽或瞬时错误）并等待资源恢复后，代替用户重新发起该轮执行。协议边界：
+
+- Host 发起的恢复**不是新的输入类别**，而是复用现有 command：首选 `retryTurn`（canonical
+  intent rewind 重放，遵守 `retryPreservesFullIntent`），协议探测不可用时回退携带归属字段的
+  `sendText`（与 `automationId` / `offPeakTaskId` + `offPeakRunType` 同级的互斥归属身份，
+  `packages/shared/src/zcode-protocol-v4/command.ts:126-151`）。
+- 无论哪条路径，admission 仍走 CLI `CommandInbox` 串行裁决与 owner/lease 路由
+  （`acceptedInputHasSingleAuthority`）；Host / scheduler / renderer 不因自动续跑获得第二
+  份已接纳队列或绕过 CAS（`baseRevision` + `baseLogEpoch`）。
+- 自动恢复产生的 turn 保留其归属身份（resume 来源 + attempt 序号），UI 横幅据此展示
+  「将自动继续 / 已停止自动重试」；用户的新消息、编辑、删除按
+  [docs/quota-watchdog/spec.md](./quota-watchdog/spec.md) §3.4 取消 pending 意图，且用户
+  stop 一次自动 turn 即视为放弃自动重试。
+- 机器状态（pending 意图、看门狗快照）属于 Host 侧服务的持久化状态，不属于 conversation
+  projection；conversation 协议只观察由恢复执行产生的正常 command / turn 事实。
+
 ### Target Object
 
 | 值 | 含义 |

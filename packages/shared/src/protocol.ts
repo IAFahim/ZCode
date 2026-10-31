@@ -360,6 +360,15 @@ export interface AppSettings {
   toolSearchMode?: AppToolSearchMode;
   /** 新建或冷恢复 Session 是否启用 Memory；默认关闭。 */
   memoryEnabled?: boolean;
+  // 配额守护与自动续跑（docs/quota-watchdog/spec.md §3.5）；缺省按 schema 默认值兼容。
+  /** 任务失败后是否自动等待额度重置/按阶梯重试并续跑；默认开启。 */
+  autoResumeEnabled?: boolean;
+  /** 额度 ≤1% 且存在可认领重置卡时是否自动核销；默认开启。 */
+  autoClaimResetCardsEnabled?: boolean;
+  /** 看门狗 WATCHING 进入线（百分比 1–50）；默认 10。 */
+  quotaWatchThresholdPercent?: number;
+  /** 同一 task 连续自动续跑上限（1–20）；默认 5。 */
+  autoResumeMaxConsecutive?: number;
   onboardingOccupation?:
     | "office"
     | "developer"

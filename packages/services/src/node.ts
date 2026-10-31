@@ -330,6 +330,33 @@ export {
 export { AutomationService, InvalidCronExprError } from "./session/automationService.js";
 // 闲时任务与 automation 同库不同表；类型/常量全独立。
 export { OffPeakTaskRepo, OFF_PEAK_CLAIM_STALE_MS } from "./session/offPeakTaskRepo.js";
+export {
+  ResumeIntentRepo,
+  nextTransientEligibleAt,
+  quotaEligibleAt,
+  isResumePendingConflict,
+  RESUME_DISPATCH_STALE_MS,
+} from "./session/resumeIntentRepo.js";
+export {
+  QuotaWatchdogService,
+  type QuotaResumeDispatchPort,
+  type QuotaWatchdogServiceDeps,
+} from "./usage-stats/quotaWatchdogService.js";
+export {
+  computeWakeDelayMs,
+  createInitialWatchdogStatus,
+  isOpportunityThrottleError,
+  isOpportunityTransientError,
+  nextOpportunityCooldownUntil,
+  resolveClaimTarget,
+  shouldAttemptOpportunityCall,
+  transitionOnObservationError,
+  transitionWatchdogState,
+  watchdogPollDelayMs,
+  QUOTA_WATCHDOG_CLAIM_THRESHOLD_PERCENT,
+  WATCHING_CADENCE_MAX_MS,
+  WATCHING_CADENCE_MIN_MS,
+} from "./usage-stats/quotaWatchdogDomain.js";
 // host 域终态回填 files_changed 复用现有 task diff 汇总。
 export { buildTaskChangeSummary } from "./session/taskChangeSummary.js";
 export { OffPeakTaskService } from "./session/offPeakTaskService.js";
@@ -504,6 +531,13 @@ import {
 } from "./model-provider/accountRequestAuthService.js";
 import { createSourceServerWorkspaceService } from "./source-server-workspace/sourceServerWorkspaceService.js";
 import { createUsageStatsService } from "./usage-stats/usageStatsService.js";
+import {
+  QuotaWatchdogService,
+  type QuotaResumeDispatchPort,
+} from "./usage-stats/quotaWatchdogService.js";
+import { ResumeIntentRepo } from "./session/resumeIntentRepo.js";
+import { sendHostCasCommandV4 } from "./zcode-agent/zcodeV4HostCommand.js";
+import type { CodingPlanResetScopeRequest } from "@zcode/shared";
 import { createCodingPlanSubscriptionService } from "./coding-plan-subscription/codingPlanSubscriptionService.js";
 import { createClientConfigService } from "./client-config/clientConfigService.js";
 import { IClientConfigService } from "./client-config/clientConfig.js";
@@ -2748,13 +2782,113 @@ export function createLocalServices(options: {
     .register(ISourceServerWorkspaceService, sourceServerWorkspaceService)
     .register(
       IUsageStatsService,
-      createUsageStatsService({
-        apiClient,
-        accountRequestAuthService,
-        credentialService,
-        zcodeAgentService,
-        officialMcpCredentialSource,
-      }),
+      (() => {
+        const usageStatsServiceImpl = createUsageStatsService({
+          apiClient,
+          accountRequestAuthService,
+          credentialService,
+          zcodeAgentService,
+          officialMcpCredentialSource,
+        });
+        // 配额守护与自动续跑（docs/quota-watchdog/spec.md）：运行态单例属主在本集合，
+        // renderer 经 IUsageStatsService 可选契约方法读写；意图/快照持久化在 tasks-index.sqlite。
+        const resumeIntentRepo = new ResumeIntentRepo();
+        sqliteReposToClose.push(resumeIntentRepo);
+        const quotaWatchdogLogger = createServiceLogger("quota-watchdog");
+        // 自动续跑派发 port：retryTurn 优先（host CAS 探测），失败回退 attributed sendText。
+        const RESUME_PROMPT_TEXT =
+          "The previous run was interrupted by a recoverable error (usage limit or transient API failure). Continue the interrupted task exactly where you left off.";
+        const quotaResumeDispatchPort: QuotaResumeDispatchPort = {
+          isTaskActive: async ({ taskId, workspacePath, workspaceIdentity }) => {
+            const meta = await zcodeTaskService.getTaskMeta({
+              taskId,
+              workspacePath,
+              ...(workspaceIdentity ? { workspaceIdentity } : {}),
+            });
+            return meta?.status === "running";
+          },
+          retryTurn: async ({
+            sessionId,
+            workspacePath,
+            workspaceIdentity,
+            rowTarget,
+            resumeIntentId,
+          }) => {
+            await sendHostCasCommandV4({
+              send: (envelope) =>
+                zcodeAgentService.sendConversationCommandV4({
+                  workspacePath,
+                  ...(workspaceIdentity ? { workspaceIdentity } : {}),
+                  envelope,
+                }),
+              type: "retryTurn",
+              payload: { target: rowTarget },
+              sessionId,
+              contextMessage: `quota-watchdog resume session=${sessionId} intent=${resumeIntentId}`,
+            });
+          },
+          sendResumeText: async ({ sessionId, resumeIntentId }) => {
+            await zcodeTaskService.sendPrompt({
+              taskId: sessionId,
+              traceId: `resume-${resumeIntentId}`,
+              content: RESUME_PROMPT_TEXT,
+              clientMode: "desktop-continuous",
+              resumeIntentId,
+            });
+          },
+          awaitTurnOutcome: ({ sessionId, timeoutMs }) =>
+            new Promise((resolve) => {
+              let settled = false;
+              const settle = (value: {
+                outcome: "completed" | "failed";
+                errorMessage?: string;
+              }) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                disposable.dispose();
+                resolve(value);
+              };
+              const disposable = zcodeTaskService.onDynamicStreamEvent(sessionId)((event) => {
+                if (event.type === "task_complete") {
+                  settle({ outcome: "completed" });
+                } else if (event.type === "task_error") {
+                  settle({ outcome: "failed", errorMessage: event.error });
+                }
+              });
+              const timer = setTimeout(
+                () => settle({ outcome: "failed", errorMessage: "dispatch outcome timeout" }),
+                timeoutMs ?? 60 * 60_000,
+              );
+            }),
+        };
+        const quotaWatchdog = new QuotaWatchdogService({
+          usageStatsService: usageStatsServiceImpl,
+          resumeIntentRepo,
+          settingService,
+          dispatch: quotaResumeDispatchPort,
+          // 与闲时/MCP 共用同一"当前选中 Coding Plan 连接"裁定闭包，不另建解析路径。
+          resolveResetScope: async () => {
+            const resolved = await offPeakCredentialResolverDeps.resolveAccountProvider();
+            if (!resolved) return null;
+            return {
+              preferredProviderId: resolved.providerId,
+              accountAccess: resolved.access,
+            } satisfies CodingPlanResetScopeRequest;
+          },
+        });
+        void quotaWatchdog.init().catch((error: unknown) => {
+          quotaWatchdogLogger.warn("quota watchdog init failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        return Object.assign(usageStatsServiceImpl, {
+          reportAutoResumeFailure: quotaWatchdog.reportAutoResumeFailure.bind(quotaWatchdog),
+          cancelAutoResume: quotaWatchdog.cancelAutoResume.bind(quotaWatchdog),
+          getAutoResumeIntent: quotaWatchdog.getAutoResumeIntent.bind(quotaWatchdog),
+          getQuotaWatchdogStatus: quotaWatchdog.getQuotaWatchdogStatus.bind(quotaWatchdog),
+        });
+      })(),
     )
     .register(ICodingPlanSubscriptionService, codingPlanSubscriptionService)
     .register(

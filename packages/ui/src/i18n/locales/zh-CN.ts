@@ -3308,6 +3308,20 @@ const zhCN: Record<string, string> = {
   "settings.taskAutoArchive": "自动归档旧会话",
   "settings.taskAutoArchiveDescription":
     "定时扫描，将最后活动时间超过保留期的会话自动归档；置顶和运行中的会话不受影响。",
+  // 配额守护与自动续跑（docs/quota-watchdog/spec.md §3.5）
+  "settings.autoResume.autoResumeEnabled": "失败任务自动续跑",
+  "settings.autoResume.autoResumeEnabledDescription":
+    "任务因额度耗尽或限流失败后，等待额度重置（或按退避重试）并自动继续执行。",
+  "settings.autoResume.autoClaimResetCardsEnabled": "自动核销重置卡",
+  "settings.autoResume.autoClaimResetCardsEnabledDescription":
+    "额度剩余 ≤1% 时自动核销可用的重置卡（优先五小时卡；周卡保留给你手动决策）。",
+  "settings.autoResume.quotaWatchThresholdPercent": "额度观察阈值",
+  "settings.autoResume.quotaWatchThresholdPercentDescription":
+    "剩余额度降到该百分比后进入自适应观察（越接近 0 检查越频繁）。",
+  "settings.autoResume.autoResumeMaxConsecutive": "连续自动续跑上限",
+  "settings.autoResume.autoResumeMaxConsecutiveDescription":
+    "同一任务连续自动续跑达到该次数仍无一次成功运行时，停止自动重试。",
+  "settings.autoResume.percentValue": "剩余 {percent}%",
   "settings.taskAutoArchiveDays": "归档保留时长",
   "settings.taskAutoArchiveDaysDescription": "会话最后更新时间早于该时长后，才会进入自动归档候选。",
   "settings.taskAutoArchiveDays.option.3": "3 天后归档",
@@ -6801,6 +6815,9 @@ const zhCN: Record<string, string> = {
   "chat.error.setModels": "配置",
 
   // Start Plan 单桶额度提醒
+  // 配额守护自动续跑（docs/quota-watchdog/spec.md）
+  "chat.autoResume.armedQuota": "任务失败——额度重置后将自动继续执行。",
+  "chat.autoResume.armedTransient": "任务失败——稍后将自动重试。",
   "chat.quota.startPlan.bucketDailyLow": "{model} 今日额度剩余 {percent}（{remaining} tokens）。",
   "chat.quota.startPlan.bucketActivityLow":
     "{model} 活动额度剩余 {percent}（{remaining} tokens）。",

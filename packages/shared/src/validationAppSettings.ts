@@ -555,6 +555,11 @@ const appSettingsObjectSchema = z.object({
   onboardingOccupation: appSettingsOccupationSchema.nullish(),
   proactiveSuggestionsEnabled: z.boolean().optional(),
   memoryEnabled: z.boolean().default(false),
+  // 配额守护与自动续跑（docs/quota-watchdog/spec.md §3.5）：全部 opt-out，全关 = 零行为变化。
+  autoResumeEnabled: z.boolean().default(true),
+  autoClaimResetCardsEnabled: z.boolean().default(true),
+  quotaWatchThresholdPercent: z.number().int().min(1).max(50).default(10),
+  autoResumeMaxConsecutive: z.number().int().min(1).max(20).default(5),
   lastWorkspaceSession: z.array(appWorkspaceSessionEntrySchema).default([]),
   lastActiveWorkspace: appWorkspaceSessionEntrySchema.nullable().optional(),
   remoteConversationWorkspaceBySourceServerId: z
@@ -667,6 +672,10 @@ export const appSettingsPatchSchema = z.object({
     .nullish(),
   proactiveSuggestionsEnabled: z.boolean().optional(),
   memoryEnabled: z.boolean().optional(),
+  autoResumeEnabled: z.boolean().optional(),
+  autoClaimResetCardsEnabled: z.boolean().optional(),
+  quotaWatchThresholdPercent: z.number().int().min(1).max(50).optional(),
+  autoResumeMaxConsecutive: z.number().int().min(1).max(20).optional(),
   lastWorkspaceSession: z.array(appWorkspaceSessionEntrySchema).optional(),
   lastActiveWorkspace: appWorkspaceSessionEntrySchema.nullable().optional(),
   remoteConversationWorkspaceBySourceServerId: z

@@ -161,15 +161,28 @@ export type ZCodeTaskMode =
 
 export type ZCodeOffPeakRunType = "init" | "resume";
 
-/** 单个自动输入轮的来源归因；两种后台业务身份禁止同时存在。 */
+/** 单个自动输入轮的来源归因；多种后台业务身份禁止同时存在。 */
 export type ZCodeBackgroundTurnAttribution =
-  | { automationId: string; offPeakTaskId?: never; offPeakRunType?: never }
+  | { automationId: string; offPeakTaskId?: never; offPeakRunType?: never; resumeIntentId?: never }
   | {
       offPeakTaskId: string;
       offPeakRunType?: ZCodeOffPeakRunType;
       automationId?: never;
+      resumeIntentId?: never;
     }
-  | { automationId?: undefined; offPeakTaskId?: undefined; offPeakRunType?: never };
+  | {
+      /** 配额守护自动续跑归属（docs/quota-watchdog/spec.md §3.3）。 */
+      resumeIntentId: string;
+      automationId?: never;
+      offPeakTaskId?: never;
+      offPeakRunType?: never;
+    }
+  | {
+      automationId?: undefined;
+      offPeakTaskId?: undefined;
+      offPeakRunType?: never;
+      resumeIntentId?: undefined;
+    };
 /** 当前 workspace 下任务的运行时状态 */
 export type ZCodeTaskRuntimeStatus =
   | "idle"
