@@ -344,6 +344,8 @@ export function createZCodeTaskServiceAdapter(
         ...(params.offPeakRunType ? { offPeakRunType: params.offPeakRunType } : {}),
       };
     }
+    // 配额守护自动续跑归属（resumeIntentId 与 automation/offPeak 互斥，schema 侧已校验）。
+    if (params.resumeIntentId) return { resumeIntentId: params.resumeIntentId };
     return {};
   }
 

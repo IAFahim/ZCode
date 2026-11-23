@@ -147,6 +147,13 @@ export async function sendHostCasCommandV4<T extends CommandType>(input: {
 }): Promise<CommandAck> {
   const maxAttempts = input.maxAttempts ?? 4;
   let baseRevision = 0;
+  // row-target 命令（retryTurn 等）还要求 baseLogEpoch；host 无本地投影时以占位值首发，
+  // 用 stale ACK 回传的 logEpochAtDecision 收敛（additive 字段，旧 CLI 不回传则退化为
+  // 仅 revision 收敛——届时 row-target 命令在首次 staleLogEpoch 后放弃，由调用方回退）。
+  let baseLogEpoch: string | undefined = ROW_TARGETING_COMMANDS.has(input.type)
+    ? "host-cas-probe"
+    : undefined;
+  let sawStaleLogEpoch = false;
   let lastAck: CommandAck | null = null;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const ack = await input.send(
@@ -155,12 +162,21 @@ export async function sendHostCasCommandV4<T extends CommandType>(input: {
         payload: input.payload,
         sessionId: input.sessionId,
         baseRevision,
+        ...(baseLogEpoch !== undefined ? { baseLogEpoch } : {}),
         ...(input.clientId ? { clientId: input.clientId } : {}),
       }),
     );
     if (ack.status === "stale") {
       lastAck = ack;
       baseRevision = ack.revisionAtDecision;
+      if (ack.reasonCode === "proto.staleLogEpoch") {
+        if (!ack.logEpochAtDecision) {
+          sawStaleLogEpoch = true;
+          break;
+        }
+        baseLogEpoch = ack.logEpochAtDecision;
+        continue;
+      }
       continue;
     }
     return assertV4CommandAckOk(input.type, ack, input.contextMessage);
@@ -172,6 +188,8 @@ export async function sendHostCasCommandV4<T extends CommandType>(input: {
       status: "stale",
       revisionAtDecision: baseRevision,
     },
-    `${input.contextMessage}（连续 stale，放弃重试）`,
+    sawStaleLogEpoch
+      ? `${input.contextMessage}（CLI 未回传 logEpochAtDecision，无法收敛 row-target 基线）`
+      : `${input.contextMessage}（连续 stale，放弃重试）`,
   );
 }

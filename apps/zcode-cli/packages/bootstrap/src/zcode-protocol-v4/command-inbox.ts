@@ -434,6 +434,8 @@ export class CommandInbox {
             status: "stale",
             reasonCode: "proto.staleLogEpoch",
             revisionAtDecision: revision,
+            // host 侧探测收敛用：无本地 v4 投影的提交端需要当前代际才能重试 row-target 命令。
+            ...(logEpoch ? { logEpochAtDecision: logEpoch } : {}),
           },
         };
       }

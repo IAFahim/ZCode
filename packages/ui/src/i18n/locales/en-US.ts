@@ -4110,6 +4110,20 @@ const enUS: Record<string, string> = {
   "settings.taskAutoArchive": "Auto-archive old sessions",
   "settings.taskAutoArchiveDescription":
     "Periodically archive sessions whose last activity is older than the retention window; pinned and running sessions are never affected.",
+  // Quota watchdog auto-resume (docs/quota-watchdog/spec.md §3.5)
+  "settings.autoResume.autoResumeEnabled": "Auto-resume failed tasks",
+  "settings.autoResume.autoResumeEnabledDescription":
+    "After a task fails on quota exhaustion or rate limiting, wait for the quota to reset (or retry with backoff) and resume it automatically.",
+  "settings.autoResume.autoClaimResetCardsEnabled": "Auto-claim reset cards",
+  "settings.autoResume.autoClaimResetCardsEnabledDescription":
+    "When remaining quota drops to 1%, automatically claim available reset cards (five-hour cards first; weekly cards are left for you).",
+  "settings.autoResume.quotaWatchThresholdPercent": "Quota watch threshold",
+  "settings.autoResume.quotaWatchThresholdPercentDescription":
+    "Start adaptive quota polling when remaining drops to this percentage (checks speed up as it approaches zero).",
+  "settings.autoResume.autoResumeMaxConsecutive": "Max consecutive auto-resumes",
+  "settings.autoResume.autoResumeMaxConsecutiveDescription":
+    "Stop auto-resuming a task after this many consecutive attempts without a successful run.",
+  "settings.autoResume.percentValue": "{percent}% remaining",
   "settings.taskAutoArchiveDays": "Archive retention",
   "settings.taskAutoArchiveDaysDescription":
     "A session becomes eligible for auto-archive only after its last update is older than this window.",
@@ -7849,6 +7863,11 @@ const enUS: Record<string, string> = {
   "chat.error.setModels": "Set",
 
   // Start Plan per-bucket quota reminders
+  // Quota watchdog auto-resume (docs/quota-watchdog/spec.md)
+  "chat.autoResume.armedQuota":
+    "Task failed — it will resume automatically once the plan quota resets.",
+  "chat.autoResume.armedTransient":
+    "Task failed — it will retry automatically in a few minutes.",
   "chat.quota.startPlan.bucketDailyLow":
     "{model} has {percent} of its daily quota remaining ({remaining} tokens).",
   "chat.quota.startPlan.bucketActivityLow":

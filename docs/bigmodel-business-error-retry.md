@@ -65,6 +65,26 @@ BigModel / Z.AI 兼容接口会把一部分可恢复失败包装成业务错误�
 
 这类错误即使由 HTTP 429 携带，也保持非重试。原因是它们不是瞬时并发或平台负载问题，自动 retry 会浪费预算，也可能加重 provider 侧的限流。
 
+## 额度耗尽后的预算外自动续跑（2026-10-30 增补，spec-first）
+
+「配额守护与自动续跑」特性（[docs/quota-watchdog/spec.md](./quota-watchdog/spec.md)）在**轮
+失败之后**、Host 侧补充预算外恢复，本表分类不变：
+
+- 轮内语义不变：上表 terminal 额度码（`1005`、`1308`、`1310`、`1304`、`1313` 等）与
+  瞬时码的重试/不重试分类、attempt 预算、streaming 边界都保持原样；自动续跑只在既有
+  轮内重试全部耗尽、turn 进入 failed 之后触发，不新增任何轮内重试。
+- 额度类失败（本表 terminal 额度码，或 UI 归因 `failureReason="quota_exhausted"`，
+  `packages/ui/src/lib/chatErrorAttribution.ts:117,241-245`）：Host 侧等待套餐配额重置
+  （`nextResetTime + 60s` 或看门狗 `quotaRestored` 事件）后，经 v4 `retryTurn` 重放
+  canonical intent 恢复执行；不提前、不放大请求。
+- 瞬时类失败（本表可重试码在预算耗尽后仍失败）：按 1min → 5min → 15min 退避阶梯自动
+  恢复，三档用尽停止并交还用户。
+- 守卫：同一任务连续自动续跑次数上限（默认 5，无一次成功 turn 即停）；用户新消息/编辑/
+  删除取消意图。派发与执行链路、归属（attribution）协议见
+  [docs/quota-watchdog/tech-design.md](./quota-watchdog/tech-design.md) 与
+  [conversation-product-protocol.md](./conversation-product-protocol.md) 的 Host-Initiated
+  Resume 一节。
+
 ## 日志
 
 没有新增日志入口，继续复用 model runner 的结构化状态事件：

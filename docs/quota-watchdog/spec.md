@@ -1,0 +1,294 @@
+# 配额守护与自动续跑（Quota Watchdog + Auto-Resume）v1 实现 Spec
+
+> **状态：spec-first（2026-10-30 立项，尚未实现）。** 本文只定义产品规则、阈值、状态所有者与
+> 验收场景；模块放置、接线点、CAS 探测扩展与风险登记见 [tech-design.md](./tech-design.md)。
+> 实现前本文必须先评审通过；实现后按实际行为回写。
+
+> 术语约定：TypeScript 类型/变量/常量分别使用 `QuotaWatchdog*` / `quotaWatchdog*` /
+> `QUOTA_WATCHDOG_*`；自动续跑意图使用 `ResumeIntent*` / `resumeIntent*`。SQLite 表使用
+> `resume_intents`（见 tech-design §4）。
+
+## 1. 一句话定义
+
+配额守护与自动续跑 = 桌面 Host 进程内的两个耦合行为：
+
+1. **自动续跑（auto-resume）**：任务轮失败（套餐额度耗尽或瞬时 API 错误）后，由 Host 侧
+   自动恢复执行。额度失败等待套餐配额重置；瞬时失败按 1min → 5min → 15min 退避阶梯重试。
+2. **配额守护（quota watchdog）**：Host 侧服务轮询套餐剩余百分比；≤10% 进入自适应观察，
+   ≤1% 自动认领可用的重置卡（复用现有 `/use` 端点，此前只能由用户点击触发），0% 等待重置
+   后发出一次 `quotaRestored` 事件，作为额度类续跑意图的唤醒源之一。
+
+一句话产品语义：**用户不在场时，让"额度耗尽 / 瞬时失败"的任务在资源恢复后自动继续跑，
+并在低额度时替用户核销本就属于用户的重置卡；用户随时可干预，所有动作可关闭、可追溯。**
+
+触发边界（先于一切自动行为）：自动续跑**只在既有轮内重试全部耗尽、turn 进入 failed 之后**
+触发（adapter attempt 预算与 streaming recovery 次数已先行消耗，见
+[bigmodel-business-error-retry.md](../bigmodel-business-error-retry.md)）。轮内重试语义不变，
+本特性不新增任何轮内重试。
+
+## 2. 领域模型与术语
+
+```ts
+/** 看门狗状态。运行态唯一所有者是 quotaWatchdogService（Host 进程，见 §4）。 */
+type QuotaWatchdogState =
+  | "idle" // remaining > watch 阈值，被动节奏
+  | "watching" // remaining ≤ 10%，自适应节奏
+  | "claiming" // remaining ≤ 1% 且存在可认领重置卡，正在核销
+  | "waiting_reset" // remaining ≈ 0 且无卡可领；wakeAt = nextResetTime + 60s
+  | "restored"; // 观察到 remaining > 0，本耗尽周期内发一次 quotaRestored
+
+/** 自动续跑意图。持久化所有者是 resume_intents 表（每 task 至多一条 pending，见 §4）。 */
+interface ResumeIntent {
+  resumeIntentId: string;
+  taskId: string; // 宿主 conversation/task id
+  workspaceKey: string; // workspaceIdentity?.trim() || workspacePath
+  workspaceIdentity?: string;
+  kind: "quota" | "transient"; // 额度等待重置 vs 退避阶梯
+  attempt: number; // 已自动续跑次数（成功一轮后清零）
+  nextEligibleAt: number; // quota: nextResetTime+60s / quotaRestored；transient: 阶梯下一档
+  createdAt: number;
+  updatedAt: number;
+}
+```
+
+关键概念：
+
+- **耗尽周期（exhaustion cycle）**：从看门狗首次观察到 remaining ≤ 阈值，到观察到重置后
+  remaining > 0 为止的一段。`quotaRestored` 每个耗尽周期**恰好发一次**，用于唤醒额度类
+  续跑意图；重复轮询同一恢复不得重发。
+- **重置卡（reset card）**：服务端 `/opportunity` 发放的 `FIVE_HOUR` / `WEEK` 重置机会。
+  资格判断永远在服务端；看门狗只消费 `status` 里已存在的有效机会，不本地造卡。
+- **归属（attribution）**：自动续跑产生的 turn 必须可归因（host 发起的恢复执行带执行身份
+  标记），协议边界见 [conversation-product-protocol.md](../conversation-product-protocol.md)
+  的 Host-Initiated Resume 一节。
+
+## 3. 产品规则
+
+### 3.1 配额守护状态机与轮询节奏
+
+```text
+                remaining > 10%
+        ┌──────────────────────────────────┐
+        v                                  │
+     ┌──────┐  remaining ≤ 10%          ┌─────────┐
+     │ IDLE │ ─────────────────────────▶ │ WATCHING│
+     └──────┘                            └─────────┘
+        ▲                                  │ │
+        │ remaining ≤ 1% 且 status 有可认领卡
+        │                                  v │
+        │                            ┌──────────┐
+        │        /use 完成（对账成功）│ CLAIMING │
+        │      ┌──────────────────────└──────────┘
+        │      │                            │ 无卡可领 / 认领被拒
+        │      │ remaining ≈ 0              v
+        │      │                      ┌───────────────┐
+        │      │                      │ WAITING_RESET │ wakeAt = nextResetTime+60s
+        │      │                      └───────────────┘
+        │      │                            │ wake 后轮询证实 remaining > 0
+        │      │                            v
+        │      └───────────────────── ┌──────────┐
+        └──────────────────────────── │ RESTORED │ 发一次 quotaRestored → 回 IDLE
+                                       └──────────┘
+```
+
+节奏（每次观测都走 live 网络快照，无 Host 侧缓存，见 tech-design §7）：
+
+| 状态 | 轮询间隔 | 请求 |
+| --- | --- | --- |
+| IDLE（>10%） | 被动：复用既有 usage 刷新时机，不新增周期定时器 | entitlement snapshot |
+| WATCHING（≤10%） | `clamp(remaining × 30s, 20s, 2min)`（remaining 按百分比数值） | snapshot；进入时补查一次 reset status |
+| CLAIMING（≤1% 且有卡） | 30–45s | snapshot + status；满足冷却规则才 `/use` |
+| WAITING_RESET（0% 无卡） | 休眠到 `nextResetTime + 60s` 再醒 | 醒后每 60s 一次 snapshot，直至 remaining > 0 |
+| RESTORED | 立即回到 IDLE 节奏 | 发 `quotaRestored`（一次） |
+
+规则：
+
+- 快照抛错（订阅未知、账号切换断言失败）时**保留 last-good 快照**继续按旧节奏调度，不清空
+  状态、不回 IDLE；连续失败按既有 usage 失败退避，不放大请求。
+- 阈值只读百分比 `remaining.percentage`；无百分比的套餐（部分 Start Plan 快照）不进入
+  WATCHING 之后的任何主动状态，只保持被动展示。
+- `quotaWatchThresholdPercent` 设置（§3.5）只改 WATCHING 进入线（≤1% 的 CLAIMING 线固定
+  1%），且不允许配置为高于 50 的值（校验在设置 schema，见 tech-design §10）。
+
+### 3.2 重置卡自动认领（auto-claim）
+
+- 进入 CLAIMING 的前提：remaining ≤ 1% **且** `/status` 返回未过期的有效机会
+  （`availableFiveHourResets` / `availableWeekResets` 非空）。
+- 看门狗**可以触发 `POST /opportunity` 资格判断**，但仅限主动状态（WATCHING / CLAIMING /
+  WAITING_RESET）且冷却允许时。原因：renderer Coordinator 在窗口 hidden 时停止轮询
+  （`codingPlanQuotaResetCoordinator.ts` 的 visibility 规则），用户离开期间若无人触发资格
+  判断，服务端不会发放新卡，"离开期间自动认领"就会落空。看门狗在主动状态补位触发，触发
+  规则与 Coordinator 完全一致；该参与方式等价于既有设计已容忍的"多一个窗口独立轮询参与者"
+  （多窗口不做 leader election，由服务端幂等与限流兜底）。看门狗仍不做任何本地资格判断——
+  是否发放由服务端在 `/opportunity` 里裁决。IDLE（remaining > 阈值）绝不触发。
+- 核销走既有 `POST /use`（idempotency_key + reset_type），语义与用户点击完全一致：
+  - 优先核销 **FIVE_HOUR**；若无五小时卡仅有周卡，则核销 WEEK。两类都有时只用五小时卡
+    （最小代价原则），周卡仍留给用户手动决策。
+  - 认领成功 = `/use` 返回 `used:true` 后，按既有对账协议（`/status` 在
+    `[0, 250, 750, 1500]ms` 重试，观察 `latest*ResetHistory.usedAt` 变化）确认。
+  - **认领期间（含对账循环）绝不调用 `/opportunity`**——复用既有互斥规则，避免撞发卡锁
+    触发 429。
+- 冷却规则与 renderer Coordinator 完全一致（同一 scope 维度）：`granted → +10min`、
+  `denied(3301) → max(next_try_at, +5min)`、瞬时错误 → `+5min` 复用同一幂等 key、
+  429/稳定错误 → `+10min` 换新 key（详见 tech-design §8）。
+- 并发安全：服务端按机会核销结算，看门狗与用户手动点击并发不会双消费同一张卡
+  （`packages/ui/src/hooks/useCodingPlanQuotaResetUi.ts:751-758` 记录了同一竞态边界）。
+  看门狗在发起 `/use` 前必须与 renderer 共享同一 scope 级核销轨迹（tech-design §8），
+  对账后无可核销机会即放弃，不携带新幂等键重试。
+- 可见性：每次自动认领必须（1）弹系统级 toast 告知用户"已自动重置额度"，（2）进入既有
+  重置 history 展示链路（与手动核销同一份 `used_at` 事实，不造第二条历史）。
+- 开关 `autoClaimResetCardsEnabled=false` 时：CLAIMING 状态不进入，remaining ≤ 1% 直接
+  落在 WAITING_RESET（若有 pending 额度类续跑意图，仍等自然重置唤醒）。
+
+### 3.3 失败任务自动续跑（auto-resume）
+
+触发（2026-10-30 实现回写：失败事实由 **renderer 上报**，Host 侧所有与调度）：
+
+- renderer 在会话进入 failed 时（`useAutoResumeReport`，SessionPane 挂载点）把观察到的
+  失败事实经 `IUsageStatsService.reportAutoResumeFailure` 上报：taskId、workspace、kind、
+  errorMessage。意图的接纳、去重（每 task 一条 pending）、调度全部由 Host 侧
+  `quotaWatchdogService` 所有；设置关闭时 Host 直接忽略上报（零行为变化）。
+- v1 归因口径**从紧**（实现回写，窄于初稿的"网络/服务端瞬时错误"泛类）：
+  - **额度失败（kind=quota）**：provider 业务码 `1005` / `1304` / `1308` / `1310` / `1313`、
+    `attribution.reason === "quota_exhausted"`（CLI 可信根因，
+    `chatErrorAttribution.ts` 同口径）、或 legacy 包装文案（exceed limit / quota exceeded）。
+  - **瞬时失败（kind=transient）**：限流族业务码 `429` / `3002` / `2007` / `1302` / `1303` /
+    `1305`，或 `error.source === "network"`。
+  - 其余失败（鉴权、配置、工具等）不上报、不自动重试，交还用户。
+
+调度：
+
+| kind | 唤醒条件 | 放弃条件 |
+| --- | --- | --- |
+| quota | `nextEligibleAt = nextResetTime + 60s` 到期；派发门前**再用 live 快照证实** remaining > 0（未恢复则守卫重排，不消耗 attempt；实现回写新增 `reschedulePending`） | 用户干预（§3.4）；连续次数上限（§3.3.1） |
+| transient | 退避阶梯 1min → 5min → 15min（每次失败后进入下一档） | 三档全部用尽仍失败 → 停止 + 手动横幅 |
+
+- 每个 task 至多一条 pending 意图；重复失败只更新既有意图（attempt+1、nextEligibleAt 推进），
+  不叠加。
+- 派发前守卫：目标 task 若已有用户活动（task index 显示 running，即用户新消息/手动重试
+  已被 admission 接纳）→ 意图取消；意图行已删除（task 删除后派发目标不存在）→ 结算走失败
+  路径收敛（§3.4 的 v1 边界）。
+- 恢复执行：v4 `retryTurn`（canonical intent 重放）经 host CAS 探测（含 baseLogEpoch 收敛，
+  ACK 新增 additive 字段 `logEpochAtDecision`）；**实现回写**：v1 上报暂不携带失败行
+  row target（SessionPane 行定位延后），因此实际派发路径为 attributed `sendText`
+  （`resumeIntentId` 归属，schema 与 automation/offPeak 互斥）；row target 捕获补齐后
+  retryTurn 自动成为首选，代码已就绪。两条路径都复用既有 CommandInbox admission 与
+  owner/lease 路由，不新增第二条写入路径。
+- 成功定义：自动续跑触发的 turn 正常完成（`turn.completed` 语义）→ attempt 清零、意图删除。
+
+#### 3.3.1 连续上限
+
+- `autoResumeMaxConsecutive`（默认 5）：同一 task 连续 N 次自动续跑**都没有产生一次成功
+  turn** 后停止，落"已暂停自动重试，请手动处理"横幅。任何一次成功 turn 都会清零计数。
+- 额度类与瞬时类共用同一计数器（同一任务上交替发生时累计），避免交替绕过上限。
+
+### 3.4 用户干预（取消语义，2026-10-30 实现 v1 边界）
+
+v1 已实现的取消路径：
+
+1. 派发前守卫：目标 task 在 task index 显示 running（用户的新消息/手动重试已被接纳在跑）
+   → 意图取消（`user_activity_active`），admission 先到者胜。
+2. 设置 `autoResumeEnabled=false` → 全部 pending 意图批转取消（`settings_disabled`）。
+3. task/会话被删除 → 派发目标不存在，失败结算把意图收敛到 exhausted（终态）。
+
+v1 暂缓（后续补齐）：renderer editUserQuery / 显式"停止自动重试"按钮 / 用户 Stop 自动 turn
+直接调用 `cancelAutoResume`。这些场景下意图仍会被 §3.3 的派发守卫与上限兜底
+（编辑重发后 task running → 守卫取消；连续失败 → attempt 上限 exhausted），不会造成
+无界自动重试。
+
+自动续跑与手动重试并发时，CommandInbox 的既有 admission 顺序仲裁，先接纳者胜。
+
+### 3.5 设置
+
+新增 4 项 App 设置（全部 opt-out、默认开启/默认值，schema 见 tech-design §10）：
+
+| 设置 | 类型 | 默认 | 语义 |
+| --- | --- | --- | --- |
+| `autoResumeEnabled` | boolean | `true` | 总开关：关闭后不创建续跑意图，既有 pending 意图转为取消 |
+| `autoClaimResetCardsEnabled` | boolean | `true` | 看门狗自动核销重置卡；关闭后重置卡仍完全由用户点击 |
+| `quotaWatchThresholdPercent` | number | `10` | WATCHING 进入线（百分比，1–50） |
+| `autoResumeMaxConsecutive` | number | `5` | 连续自动续跑上限（1–20） |
+
+- 全部关闭 = **零行为变化**：不新增网络请求、不建表、不注册调度分支（验收 H）。
+- 设置变更经既有 `SettingsChanged` 广播生效；看门狗在下一个观测点读取新值，不要求即时重启。
+
+### 3.6 平台边界与已知限制
+
+- **看门狗驻留 Desktop Host 进程，App 不运行即不工作**：等待重置、退避阶梯、观察节奏都
+  随进程存活；App 关闭期间额度恢复不会触发任何动作，重启后按 §3.7 恢复。这是 v1 的明确
+  限制，不承诺后台驻留。
+- 远程 workspace：v1 只对本地 workspace 的任务创建续跑意图；远程任务的 turn.failed 不建
+  意图（与闲时任务 v1 的本地边界一致）。
+- 手机 `/remote` 与 Web：复用桌面 Host 的既有 attachment 语义，不新建独立看门狗；手机端
+  只消费桌面侧已发生事实的展示。
+
+### 3.7 重启恢复
+
+- App 重启后：看门狗以 last-good 持久化快照（tech-design §4 的 watchdog checkpoint）重新
+  起草状态——快照过期则先取一次 live snapshot 再定态；`waiting_reset` 的 `wakeAt` 未过则
+  重新挂定时器，已过则立即进入核实轮询。
+- `resume_intents` 里 `nextEligibleAt` 已到期的 pending 意图由 scheduler 在启动恢复中认领
+  （对齐 `offPeakRepo.recoverInterrupted` 模式），未到期的等待原定时。
+
+## 4. 状态所有者（单一所有者）
+
+| 状态 | 唯一所有者 | 其他角色 |
+| --- | --- | --- |
+| 看门狗运行态（状态机 + 轮询节奏 + last-good 快照） | `quotaWatchdogService`（packages/services，Host 进程） | renderer 只读展示；main 只转发消息 |
+| `quotaRestored` 事件 | `quotaWatchdogService` 发出 | scheduler/host 消费；renderer 仅展示 |
+| 续跑意图（pending 意图集合） | `resume_intents` 表 + 其 Repo（packages/services） | 每 task 至多一条 pending；renderer 无第二份已接纳状态 |
+| 意图派发决策（认领到期意图、唤醒源仲裁） | scheduler utility process（复用既有 tick） | main 转发 `HostMessageTypes.ResumeRun` |
+| 恢复执行（retryTurn / attributed sendText） | window Local Host（复用 zcodeV4HostCommand 探测模式） | CLI CommandInbox 唯一 admission |
+| 重置卡事实与资格 | 服务端 `/status` + `/opportunity`（不改变） | 看门狗与 renderer 都是消费者 |
+| 设置 | `settingService`（磁盘 `~/.zcode/v2/setting.json`） | 经 `SettingsChanged` 广播 |
+
+## 5. UI 表现（2026-10-30 实现 v1 回写）
+
+- **已实现**：失败上报 toast（"额度重置后将自动继续" / "稍后将自动重试"，i18n
+  `chat.autoResume.*`）；设置区"使用统计"页新增配额守护卡片（4 项设置，
+  `settings.autoResume.*`，含 App 不运行即不守护的语义提示）；自动核销复用既有
+  重置完成链路（与手动核销共用 `used_at` 历史 + entitlement 刷新），不新增第二条展示。
+- **v1 暂缓**：失败横幅的"将在额度重置后自动继续（预计 HH:MM）/ 停止自动重试"次级行——
+  SessionPane 横幅改造延后；期间意图状态可经 `getAutoResumeIntent` 查询（契约已就绪）。
+- Renderer 不保存任何"已接纳"的续跑状态；全部展示来自 Host 投影/查询。
+
+## 6. 验收场景
+
+| ID | 场景 | 预期 |
+| --- | --- | --- |
+| A | remaining 从 >10% 跨到 ≤10% | 进入 WATCHING，节奏切换为 `clamp(remaining×30s, 20s, 2min)`；>10% 期间不出现任何新增周期请求（日志证据） |
+| B | ≤1% 且 status 有 FIVE_HOUR 卡 | 自动认领恰好一次（`used:true` + 对账见新 `usedAt`）；与用户并发点击不双消费；toast + history 出现；对账循环内无 `/opportunity` 请求 |
+| B2 | ≤1% 且 status 无卡（含窗口 hidden 期间 Coordinator 未触发判断） | 看门狗按冷却规则触发 `/opportunity`；`granted=false` 或冷却未到则落 WAITING_RESET 等自然重置兜底；判断频率与 Coordinator 常量一致 |
+| C | 0% 无卡可领 | 进入 WAITING_RESET，`nextResetTime+60s` 唤醒；核实 remaining>0 后 `quotaRestored` 恰好一次；pending 额度意图被派发；成功后横幅清除 |
+| D | WAITING_RESET 期间关闭 App | 重启后从 last-good 快照重新挂起看门狗；到期意图被恢复认领；不重复发 `quotaRestored`（同耗尽周期） |
+| E | 瞬时失败 | 1min → 5min → 15min 三次派发（日志可见每档间隔）；三档后停止并出手动横幅 |
+| F | 连续 N=autoResumeMaxConsecutive 次额度自动续跑均失败 | 第 N 次后停止派发，横幅切换为终止文案；一次成功 turn 后计数清零 |
+| G | pending 意图存在时用户新消息 / 编辑 / 删除 task | 意图立即取消（表内无 pending 行或状态取消）；当前周期内不自动重建 |
+| H | 四项设置全关 | 与现状零差异：无新增请求、无意图行、无调度分支（对照日志与表） |
+| I | 限流安全 | 全程无"对账期间 `/opportunity`"；granted/denied/429/瞬时 各冷却时长与 Coordinator 常量一致；`createServiceLogger` 日志可复盘每次状态迁移与请求 |
+
+每个场景的测试入口（E2E / 浏览器验收 / 可重复运行时场景）在实现阶段的 spec 回写中落实；
+本表先固定可判定行为。
+
+## 7. 明确不做（v1 non-goals）
+
+- **CLI headless 场景**：纯 CLI（无桌面 Host）不做看门狗、不做自动续跑；CLI 侧只保证
+  retryTurn / sendText 协议可用。
+- **手机端与 Web server**：不在手机 `/remote` 或 `packages/server` 侧新建看门狗或意图
+  存储；远程 workspace 不创建意图（§3.6）。
+- 不做轮内（in-turn）重试策略变更；不改 bigmodel 业务码分类表。
+- 不做看门狗本地资格判断或本地造卡；`/opportunity` 的调用主体仍是 renderer Coordinator
+  （看门狗只消费已有卡）。
+- 不做进程外驻留（App 关闭即停，§3.6）；不做跨设备协调（多桌面实例并发由服务端幂等与
+  限流兜底，同现有 reset 契约）。
+- 不做对 Start Plan 之外无百分比套餐的主动看护（无 percentage 不进主动状态）。
+- 不自动续跑用户已显式放弃的任务（无"恢复历史放弃"入口）。
+
+## 8. 与现有文档的关系
+
+- [coding-plan-quota-reset-ui.md](../coding-plan-quota-reset-ui.md)：重置 UI 与 Coordinator
+  规则不变；本文 §3.2 在其上叠加 Host 侧自动核销（该文末尾有对应增补链接）。
+- [bigmodel-business-error-retry.md](../bigmodel-business-error-retry.md)：轮内重试分类
+  不变；本文定义轮失败之后的预算外自动续跑语义（该文末尾有对应增补链接）。
+- [conversation-product-protocol.md](../conversation-product-protocol.md)：Host 发起恢复的
+  归属与 admission 边界见该文 Host-Initiated Resume 一节。

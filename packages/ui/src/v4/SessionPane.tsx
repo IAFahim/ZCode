@@ -337,6 +337,7 @@ import { useV4Conversation } from "@/v4/V4ConversationContext.js";
 import { useConversationProjection } from "@/v4/useConversationProjection.js";
 import { usePendingCommandRecovery } from "@/v4/usePendingCommandRecovery.js";
 import { useV4SessionQuotaBanner } from "@/v4/useV4SessionQuotaBanner.js";
+import { useAutoResumeReport } from "@/v4/useAutoResumeReport.js";
 import { resolveMcpUnavailableNoticeInPartition } from "@/v4/mcpUnavailableBannerNotice.js";
 import { shouldFocusTimelineAfterComposerSend } from "@/v4/promptScrollFocusPolicy.js";
 import {
@@ -5764,6 +5765,16 @@ export function SessionPane({
     modelId: snapshot?.config.model ?? null,
     usageStatsService: baseWorkspaceServices.usageStatsService,
     mcpUnavailableNotice,
+  });
+  // 配额守护自动续跑：任务失败事实上报 Host 看门狗（幂等，Host 侧去重调度）。
+  useAutoResumeReport({
+    sessionId: snapshot?.sessionId ?? sessionId,
+    workspacePath,
+    workspaceIdentity,
+    error: controlLastError,
+    errorKey: controlLastErrorKey,
+    providerId: snapshot?.config.provider ?? null,
+    usageStatsService: baseWorkspaceServices.usageStatsService,
   });
   // Bug 根因：当前显示哪条错误与「关闭」归谁曾在两处分别判断——渲染按「未关闭」状态取横幅，关闭处理却按
   // 原始状态分支；用户关掉模型失效横幅后，后续投影错误横幅的关闭按钮会一直落到已关闭的那条上而失效。

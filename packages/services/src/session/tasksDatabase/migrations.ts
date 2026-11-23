@@ -16,6 +16,7 @@ import {
   adoptSourceServerWorkspaceSchema,
   SOURCE_SERVER_SCHEMA_CHECKSUM_INPUT,
 } from "#src/session/tasksDatabase/source-server-schema-v5.js";
+import { RESUME_INTENTS_SCHEMA } from "#src/session/tasksDatabase/resume-intents-schema-v7.js";
 
 // 冻结历史列声明，不能以实时 Repo/schema 代替，否则新版构建会改变已应用 checksum。
 const columns = [
@@ -136,6 +137,12 @@ const definitions = [
       WHEN EXISTS(SELECT 1 FROM task_purge WHERE workspace_key=new.workspace_key AND task_id=new.task_id AND state='deleted')
       BEGIN SELECT RAISE(ABORT, 'task.permanently-deleted'); END;
     `),
+  },
+  {
+    id: "0008_resume_intents",
+    touchedTables: ["resume_intents", "quota_watchdog_checkpoint"],
+    checksumInput: [RESUME_INTENTS_SCHEMA],
+    apply: (db: DatabaseSync) => db.exec(RESUME_INTENTS_SCHEMA),
   },
 ] as const;
 

@@ -96,6 +96,7 @@ import { PluginsSection } from "@/settings/PluginsSection.js";
 import { HooksSection } from "@/settings/HooksSection.js";
 import { WorkspaceFileSearchSection } from "@/settings/WorkspaceFileSearchSection.js";
 import { MemorySettingsPage } from "@/settings/MemorySettingsSection.js";
+import { AutoResumeSettingsCard } from "@/settings/AutoResumeSettingsCard.js";
 import { PersonalizationSection } from "@/settings/PersonalizationSection.js";
 import { BrowserSettingsSection } from "@/settings/BrowserSettingsSection.js";
 import { ComputerUseSection } from "@/settings/ComputerUseSection.js";
@@ -2208,13 +2209,44 @@ export function SettingsPage({
                               onOpenTask={onOpenTask}
                             />
                           ) : activeSection === "usage" ? (
-                            <UsageStatsSection
-                              activeTab={usageActiveTab}
-                              providerSourcesLoading={usageProviderSettingsLoading}
-                              selectedCodingPlanSource={selectedUsageCodingPlanSource}
-                              workspaceIdentity={activeWorkspaceIdentity}
-                              workspacePath={activeWorkspacePath ?? undefined}
-                            />
+                            <div className="min-w-0 space-y-6">
+                              {/* 配额守护与自动续跑（docs/quota-watchdog/spec.md §3.5）。 */}
+                              <AutoResumeSettingsCard
+                                autoResumeEnabled={sharedSettings?.autoResumeEnabled !== false}
+                                autoClaimResetCardsEnabled={
+                                  sharedSettings?.autoClaimResetCardsEnabled !== false
+                                }
+                                quotaWatchThresholdPercent={
+                                  sharedSettings?.quotaWatchThresholdPercent ?? 10
+                                }
+                                autoResumeMaxConsecutive={
+                                  sharedSettings?.autoResumeMaxConsecutive ?? 5
+                                }
+                                onAutoResumeEnabledChange={(enabled) => {
+                                  void updateSharedSettings({ autoResumeEnabled: enabled });
+                                }}
+                                onAutoClaimResetCardsEnabledChange={(enabled) => {
+                                  void updateSharedSettings({
+                                    autoClaimResetCardsEnabled: enabled,
+                                  });
+                                }}
+                                onQuotaWatchThresholdPercentChange={(percent) => {
+                                  void updateSharedSettings({
+                                    quotaWatchThresholdPercent: percent,
+                                  });
+                                }}
+                                onAutoResumeMaxConsecutiveChange={(max) => {
+                                  void updateSharedSettings({ autoResumeMaxConsecutive: max });
+                                }}
+                              />
+                              <UsageStatsSection
+                                activeTab={usageActiveTab}
+                                providerSourcesLoading={usageProviderSettingsLoading}
+                                selectedCodingPlanSource={selectedUsageCodingPlanSource}
+                                workspaceIdentity={activeWorkspaceIdentity}
+                                workspacePath={activeWorkspacePath ?? undefined}
+                              />
+                            </div>
                           ) : activeSection === "subagents" ? (
                             <SubagentsSection
                               onManageModels={handleOpenModelProviderSettings}

@@ -100,10 +100,31 @@ CREATE TABLE projects (
  pinned_at INTEGER, deleted INTEGER NOT NULL DEFAULT 0, deleted_at INTEGER,
  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 
+CREATE TABLE quota_watchdog_checkpoint (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
 CREATE TABLE remote_project_entries (
  entry_id TEXT PRIMARY KEY, host_id TEXT NOT NULL REFERENCES hosts(host_id) ON DELETE CASCADE,
  remote_project_id TEXT, cached_name TEXT NOT NULL, cached_roots_json TEXT NOT NULL DEFAULT '[]',
  legacy_workspace_json TEXT, last_synced_at INTEGER, initial_position INTEGER, cached_deleted INTEGER NOT NULL DEFAULT 0, UNIQUE(host_id,remote_project_id));
+
+CREATE TABLE resume_intents (
+        resume_intent_id   TEXT PRIMARY KEY,
+        task_id            TEXT NOT NULL,
+        workspace_path     TEXT NOT NULL,
+        workspace_key      TEXT NOT NULL,
+        workspace_identity TEXT,
+        kind               TEXT NOT NULL,
+        attempt            INTEGER NOT NULL DEFAULT 0,
+        next_eligible_at   INTEGER NOT NULL,
+        status             TEXT NOT NULL DEFAULT 'pending',
+        last_error         TEXT,
+        created_at         INTEGER NOT NULL,
+        updated_at         INTEGER NOT NULL
+      );
 
 CREATE TABLE "schema_migration" (id text primary key, checksum text not null, app_version text, "applied_at" integer not null);
 
@@ -217,6 +238,12 @@ CREATE INDEX idx_off_peak_ws
       ON off_peak_tasks (workspace_key, status);
 
 CREATE UNIQUE INDEX idx_projects_host_name ON projects(host_id,name) WHERE deleted=0;
+
+CREATE UNIQUE INDEX idx_resume_pending
+      ON resume_intents(task_id) WHERE status = 'pending';
+
+CREATE INDEX idx_resume_pick
+      ON resume_intents (status, next_eligible_at);
 
 CREATE INDEX idx_task_group_members_group_order
       ON task_group_members (group_id, sort_order, added_at);

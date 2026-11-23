@@ -75,6 +75,8 @@ packages/desktop/resources/macos-window-bounds/
 __pycache__/
 *.pyc
 .zcode-runtime
+# ZCode 本体在自身仓库内运行时写入的会话/计划等 harness 本地状态（v2 会话数据与 plan 缓存），不入库。
+/.zcode/
 
 # CR-01：afterPack 生成的 NSIS helper define，按架构命名，不得入库
 packages/desktop/build/generated/
