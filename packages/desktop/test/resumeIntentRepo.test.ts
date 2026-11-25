@@ -98,18 +98,55 @@ describe("ResumeIntentRepo", () => {
     expect(requeued?.status).toBe("pending");
     expect(requeued?.attempt).toBe(1);
     expect(requeued?.lastError).toBe("still failing");
-    expect(await repo.requeueAfterFailure(intent.resumeIntentId, { kind: "quota", nextEligibleAt: NOW }, { now: NOW })).toBeNull();
+    expect(
+      await repo.requeueAfterFailure(
+        intent.resumeIntentId,
+        { kind: "quota", nextEligibleAt: NOW },
+        { now: NOW },
+      ),
+    ).toBeNull();
+  });
+
+  it("upsertPending(incrementAttempt:false)：renderer 上报不推进 attempt，与结算路径不双计", async () => {
+    const repo = await createRepo();
+    const first = await repo.upsertPending(upsertParams("task-1"), { now: NOW });
+    expect(first.attempt).toBe(0);
+    const second = await repo.upsertPending(upsertParams("task-1"), {
+      now: NOW + 1,
+      incrementAttempt: false,
+    });
+    expect(second.resumeIntentId).toBe(first.resumeIntentId);
+    expect(second.attempt).toBe(0);
+    // 默认语义不变：更新即 +1。
+    const third = await repo.upsertPending(upsertParams("task-1"), { now: NOW + 2 });
+    expect(third.attempt).toBe(1);
+  });
+
+  it("reschedulePending(kind)：守卫重排可改写 kind（transient→quota 转换），不消耗 attempt", async () => {
+    const repo = await createRepo();
+    const intent = await repo.upsertPending(
+      { ...upsertParams("task-1"), kind: "transient" as const },
+      { now: NOW },
+    );
+    await repo.claimDue(NOW + 60_000);
+    const converted = await repo.reschedulePending(intent.resumeIntentId, NOW + 300_000, {
+      now: NOW,
+      kind: "quota",
+    });
+    expect(converted?.kind).toBe("quota");
+    expect(converted?.attempt).toBe(0);
+    expect(converted?.status).toBe("pending");
   });
 
   it("markExhausted：终态不可逆出，cancelled 行不可再 exhausted", async () => {
     const repo = await createRepo();
     const intent = await repo.upsertPending(upsertParams("task-1"), { now: NOW });
-    const exhausted = await repo.markExhausted(intent.resumeIntentId, "attempt limit", { now: NOW });
+    const exhausted = await repo.markExhausted(intent.resumeIntentId, "attempt limit", {
+      now: NOW,
+    });
     expect(exhausted?.status).toBe("exhausted");
     expect(await repo.claimDue(NOW + 60_000)).toHaveLength(0);
-    expect(
-      await repo.markExhausted(intent.resumeIntentId, "again", { now: NOW }),
-    ).toBeNull();
+    expect(await repo.markExhausted(intent.resumeIntentId, "again", { now: NOW })).toBeNull();
   });
 
   it("cancel：pending/dispatched 均可取消；getEffectiveByTask 优先 pending 其次 exhausted", async () => {

@@ -292,3 +292,67 @@ v1 暂缓（后续补齐）：renderer editUserQuery / 显式"停止自动重试
   不变；本文定义轮失败之后的预算外自动续跑语义（该文末尾有对应增补链接）。
 - [conversation-product-protocol.md](../conversation-product-protocol.md)：Host 发起恢复的
   归属与 admission 边界见该文 Host-Initiated Resume 一节。
+
+## 9. v2 修订（2026-11-25：派发门、核销前置与 Host 侧归因）
+
+v1 上线运行暴露四个缺陷，本节为权威修订；正文 §3.1–§3.5 中与本节冲突处以本节为准。
+
+### 9.1 额度口径反转（v1 缺陷 1）
+
+- entitlement 快照的 `remaining.percentage` 承袭 quota 接口的**已用占比**（0–100），
+  与 UI `codingPlanQuotaPresentation.getQuotaRemainingPercentage` 同口径。v1 直接把它当
+  剩余值与阈值比较：耗尽判定（≤0%）永不成立 → 状态机停在 idle → reset 卡从未被自动核销。
+- 修正：统一经 `remainingPercentFromEntitlement()`（100 − used，clamp 0–100）后进入
+  状态机、轮询节奏与派发门；`QuotaWatchdogStatus.remainingPercent` 语义为剩余占比。
+
+### 9.2 Host 侧权威归因（v1 缺陷 2：失败事实仅来自可见 pane）
+
+- renderer `useAutoResumeReport` 仍只上报事实（v1 不变），但新增透传 provider 业务码与
+  CLI 归因（`providerErrorCode` / `attributionReason`）；派发 turn 的 `task_error` 事件
+  code / attribution 亦进入结算。Host `classifyTurnFailure()` 以
+  `code > attribution.reason > source=network > 消息文本` 优先级归类：
+  - `plan_expired`（1309 及 plan/subscription expired 文本）：无自动动作，不建意图、不烧卡。
+  - `quota`（1005/1304/1308/1310/1313/1316-1321、insufficient_quota 等终端额度码）。
+  - `context`（1261 及 context 溢出类文本）：先 `/compact` 再续跑一次（§9.4）。
+  - `transient`（429/3002/2007/1302/1303/1305/1312 及网络类）：按 1/5/15min 退避阶梯自动续跑。
+
+### 9.3 派发门与核销前置（用户主诉求：reset 出来即自动消费并续跑）
+
+quota 意图派发前必须过 live 快照证实：
+
+1. 剩余 > 0 → 派发（同 v1）。
+2. 剩余 ≤ 0：`autoClaimResetCardsEnabled` 且当前连接存在可核销卡 → **立即核销**（/use，
+   幂等与对账协议同 §3.2），确认成功后**当轮直接派发**——不等下个 tick、不需用户手动
+   /opportunity→/use。核销未确认 → 2min 后重试（不烧 attempt）。
+3. 无卡/未启用 → 守卫重排到 `nextResetTime + 60s`（tick 状态机继续 /opportunity 资格判断）。
+4. 快照不可用 → 5min 守卫重排；**绝不盲派发**（v1 快照失败仍放行，把整段上下文发给已耗尽的
+   API，一次失败即烧掉重置后额度的大头）。
+5. transient 意图派发前若 live 快照显示剩余 ≤ 0，改写 kind=quota 走本门（限流退避不再空转）。
+
+### 9.4 context 溢出：先压缩再续跑（v2 新增 kind）
+
+- 新增意图 kind `context`（1261/上下文溢出类失败）。首次失败：发 v4 `compact` 维护命令
+  （idle 立即执行 / busy 进 FIFO，非 CAS），20s 后守卫重排；compact 落地后续跑一次。
+- 已武装（同 task 已发过 /compact）再次 context 失败 → exhausted（压缩救不了，停止自动重试）。
+- 自发 compact 的活动窗口（10min）内 `isTaskActive` 视为己方活动，守卫重排而非取消意图。
+
+### 9.5 派发结局可靠收口与生命周期（v1 缺陷 3/4）
+
+- 结局等待改为 workspace 维度流订阅（`onDynamicTaskEvent`）+ task index 常开终态订阅
+  （`onDynamicTaskTerminalOutcome`）双通道。v1 订阅收不到事件，等待全走 60min 超时，
+  连续重派间隔恒为 1 小时。
+- 超时收口前核实任务是否仍在跑：在跑 → 意图转 `cancelled("task_still_running")`（工作继续，
+  不重复派发）；不在跑才按失败结算。
+- 用户手动 prompt（无后台归因的 sendPrompt）经 adapter `onManualPromptSubmitted` 钩子触发
+  `cancelAutoResume`（§3.4 规则落地；v1 未接线）。看门狗自发 compact / 续跑派发不触发。
+- renderer 失败上报不再推进 attempt（`incrementAttempt: false`）；attempt 由派发结算路径
+  统一 +1（v1 双路径各 +1，且并发下 UNIQUE 崩溃后计数归零，上限永不生效）。
+- 同 task 失败上报/结算经 `withTaskLock` 串行化；init 恢复两步各自收错。
+
+### 9.6 验收补充
+
+- 用量 100% + 有卡：任务失败 → 看门狗核销卡 → 同一 tick 内续跑成功（无需人工）。
+- 1305 限流失败：任务 1min 后自动续跑，期间无任何 reset 卡被核销。
+- 1309 失败：无自动动作；意图不创建。
+- 1261 失败：/compact 发出 → 续跑一次 → 若再失败即 exhausted。
+- 用户在意图 pending 期间手动发送消息：意图被取消，不再自动派发。

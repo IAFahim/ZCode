@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  claimTargetForFailure,
+  classifyTurnFailure,
   computeWakeDelayMs,
   createInitialWatchdogStatus,
   isOpportunityTransientError,
   nextOpportunityCooldownUntil,
+  remainingPercentFromEntitlement,
   resolveClaimTarget,
   transitionWatchdogState,
   watchdogPollDelayMs,
@@ -11,10 +14,7 @@ import {
   WATCHING_CADENCE_MAX_MS,
   WATCHING_CADENCE_MIN_MS,
 } from "@zcode/services/node";
-import {
-  QUOTA_WATCHDOG_DEFAULT_SETTINGS,
-  RESUME_QUOTA_WAKE_MARGIN_MS,
-} from "@zcode/shared";
+import { QUOTA_WATCHDOG_DEFAULT_SETTINGS, RESUME_QUOTA_WAKE_MARGIN_MS } from "@zcode/shared";
 
 // 配额守护纯领域逻辑回归（docs/quota-watchdog/spec.md §3.1/§3.2）。
 
@@ -59,10 +59,17 @@ describe("配额守护状态机", () => {
   });
 
   it("watching：≤1% 且有卡进入 claiming", () => {
-    const prev = { ...createInitialWatchdogStatus(), state: "watching" as const, exhaustionCycleId: "cycle-1" };
+    const prev = {
+      ...createInitialWatchdogStatus(),
+      state: "watching" as const,
+      exhaustionCycleId: "cycle-1",
+    };
     const result = transitionWatchdogState(
       prev,
-      observation({ remainingPercent: QUOTA_WATCHDOG_CLAIM_THRESHOLD_PERCENT, hasClaimableCard: true }),
+      observation({
+        remainingPercent: QUOTA_WATCHDOG_CLAIM_THRESHOLD_PERCENT,
+        hasClaimableCard: true,
+      }),
       SETTINGS,
       NOW,
       nextCycleId,
@@ -71,7 +78,11 @@ describe("配额守护状态机", () => {
   });
 
   it("watching：≤1% 无卡不进入 claiming（claim 线不看阈值设置）", () => {
-    const prev = { ...createInitialWatchdogStatus(), state: "watching" as const, exhaustionCycleId: "cycle-1" };
+    const prev = {
+      ...createInitialWatchdogStatus(),
+      state: "watching" as const,
+      exhaustionCycleId: "cycle-1",
+    };
     const result = transitionWatchdogState(
       prev,
       observation({ remainingPercent: 1, hasClaimableCard: false }),
@@ -83,7 +94,11 @@ describe("配额守护状态机", () => {
   });
 
   it("watching：0% 无卡进入 waiting_reset，wakeAt = nextResetTime + 裕量", () => {
-    const prev = { ...createInitialWatchdogStatus(), state: "watching" as const, exhaustionCycleId: "cycle-1" };
+    const prev = {
+      ...createInitialWatchdogStatus(),
+      state: "watching" as const,
+      exhaustionCycleId: "cycle-1",
+    };
     const nextResetTime = NOW + 60 * 60_000;
     const result = transitionWatchdogState(
       prev,
@@ -135,7 +150,11 @@ describe("配额守护状态机", () => {
   });
 
   it("claiming：卡消失且 remaining ≈0 → waiting_reset", () => {
-    const prev = { ...createInitialWatchdogStatus(), state: "claiming" as const, exhaustionCycleId: "cycle-1" };
+    const prev = {
+      ...createInitialWatchdogStatus(),
+      state: "claiming" as const,
+      exhaustionCycleId: "cycle-1",
+    };
     const result = transitionWatchdogState(
       prev,
       observation({ remainingPercent: 0, hasClaimableCard: false }),
@@ -160,14 +179,28 @@ describe("配额守护状态机", () => {
   });
 
   it("restored 兜底折叠：≤ 阈值回 watching，> 阈值回 idle", () => {
-    const prev = { ...createInitialWatchdogStatus(), state: "restored" as const, exhaustionCycleId: "cycle-1" };
+    const prev = {
+      ...createInitialWatchdogStatus(),
+      state: "restored" as const,
+      exhaustionCycleId: "cycle-1",
+    };
     expect(
-      transitionWatchdogState(prev, observation({ remainingPercent: 5 }), SETTINGS, NOW, nextCycleId)
-        .status.state,
+      transitionWatchdogState(
+        prev,
+        observation({ remainingPercent: 5 }),
+        SETTINGS,
+        NOW,
+        nextCycleId,
+      ).status.state,
     ).toBe("watching");
     expect(
-      transitionWatchdogState(prev, observation({ remainingPercent: 60 }), SETTINGS, NOW, nextCycleId)
-        .status.state,
+      transitionWatchdogState(
+        prev,
+        observation({ remainingPercent: 60 }),
+        SETTINGS,
+        NOW,
+        nextCycleId,
+      ).status.state,
     ).toBe("idle");
   });
 });
@@ -246,5 +279,54 @@ describe("重置卡认领与 /opportunity 冷却", () => {
       false,
     );
     expect(isOpportunityTransientError(new Error("no_bigmodel_api_key"))).toBe(false);
+  });
+});
+
+describe("v2 额度口径与失败归因（spec.md §3.6）", () => {
+  it("remainingPercentFromEntitlement：快照已用占比反转为剩余占比（v1 未反转导致耗尽判定永不成立）", () => {
+    expect(remainingPercentFromEntitlement(0)).toBe(100);
+    expect(remainingPercentFromEntitlement(30)).toBe(70);
+    expect(remainingPercentFromEntitlement(100)).toBe(0);
+    expect(remainingPercentFromEntitlement(120)).toBe(0);
+    expect(remainingPercentFromEntitlement(-5)).toBe(100);
+    expect(remainingPercentFromEntitlement(null)).toBeNull();
+    expect(remainingPercentFromEntitlement(undefined)).toBeNull();
+    expect(remainingPercentFromEntitlement(Number.NaN)).toBeNull();
+  });
+
+  it("classifyTurnFailure：code 优先；1309=plan_expired、1308/1310=quota、1261=context、1305=transient", () => {
+    expect(classifyTurnFailure({ code: "1309" })).toBe("plan_expired");
+    expect(classifyTurnFailure({ code: "1308" })).toBe("quota");
+    expect(classifyTurnFailure({ code: "1310" })).toBe("quota");
+    expect(classifyTurnFailure({ code: "1261" })).toBe("context");
+    expect(classifyTurnFailure({ code: "1305" })).toBe("transient");
+    expect(classifyTurnFailure({ code: "429" })).toBe("transient");
+    expect(classifyTurnFailure({ attributionReason: "quota_exhausted" })).toBe("quota");
+    expect(classifyTurnFailure({ attributionReason: "context_exceeded" })).toBe("context");
+    expect(classifyTurnFailure({ source: "network" })).toBe("transient");
+    expect(classifyTurnFailure({ message: "request context window exceeded" })).toBe("context");
+    expect(classifyTurnFailure({ message: "exceed quota limit" })).toBe("quota");
+    expect(classifyTurnFailure({ message: "plan has expired" })).toBe("plan_expired");
+    expect(classifyTurnFailure({ message: "rate limit exceeded, retry later" })).toBe("transient");
+    expect(classifyTurnFailure({})).toBeNull();
+    // code 类别优先于消息兜底：1308 即使消息含 rate limit 仍是额度类
+    expect(classifyTurnFailure({ code: "1308", message: "rate limit" })).toBe("quota");
+    // code 不在任何类别集 + 无归因 → null（调用方按意图 kind 兜底）
+    expect(classifyTurnFailure({ code: "9999" })).toBeNull();
+  });
+
+  it("claimTargetForFailure：仅 quota（含 null 兜底）允许核销卡；plan_expired/context/transient 一律不烧", () => {
+    const cards = {
+      availableFiveHourResets: [{ expireAt: NOW + 1_000 }],
+      availableWeekResets: [],
+      latestFiveHourResetHistory: null,
+      latestWeekResetHistory: null,
+      hasUnreadHistory: false,
+    };
+    expect(claimTargetForFailure("quota", cards, NOW)).toBe("FIVE_HOUR");
+    expect(claimTargetForFailure(null, cards, NOW)).toBe("FIVE_HOUR");
+    expect(claimTargetForFailure("plan_expired", cards, NOW)).toBeNull();
+    expect(claimTargetForFailure("context", cards, NOW)).toBeNull();
+    expect(claimTargetForFailure("transient", cards, NOW)).toBeNull();
   });
 });

@@ -165,16 +165,19 @@ export class ResumeIntentRepo {
   // ---- 写入 ----
 
   /**
-   * 建 pending 意图；同 task 已有 pending 时**更新**既有行（attempt 在既有值上 +1，
-   * kind/nextEligibleAt 以最新失败为准），不叠加第二行。返回生效后的意图。
+   * 建 pending 意图；同 task 已有 pending 时**更新**既有行
+   * （attempt 仅在 incrementAttempt 时 +1：v2 修订——renderer 失败上报与派发结局结算
+   * 描述的是同一次失败，双路径各自 +1 会把连续计数翻倍并提前耗尽上限；
+   * 默认 incrementAttempt=true 保留既有语义），不叠加第二行。返回生效后的意图。
    */
   async upsertPending(
     params: ResumeIntentUpsertParams,
-    options?: { now?: number },
+    options?: { now?: number; incrementAttempt?: boolean },
   ): Promise<ResumeIntent> {
     await this.ensureReady();
     const db = this.getDatabase();
     const now = options?.now ?? Date.now();
+    const attemptDelta = options?.incrementAttempt === false ? 0 : 1;
     const workspaceKey = resolveWorkspaceKey({
       workspacePath: params.workspacePath,
       workspaceIdentity: params.workspaceIdentity,
@@ -186,7 +189,7 @@ export class ResumeIntentRepo {
         db.prepare(
           `UPDATE resume_intents
           SET kind = @kind,
-              attempt = attempt + 1,
+              attempt = attempt + @attempt_delta,
               next_eligible_at = @next_eligible_at,
               workspace_path = @workspace_path,
               workspace_key = @workspace_key,
@@ -197,6 +200,7 @@ export class ResumeIntentRepo {
         ).run({
           id: existing.resume_intent_id,
           kind: params.kind,
+          attempt_delta: attemptDelta,
           next_eligible_at: params.nextEligibleAt,
           workspace_path: params.workspacePath,
           workspace_key: workspaceKey,
@@ -320,7 +324,11 @@ export class ResumeIntentRepo {
   }
 
   /** 连续上限触达：终态 exhausted（不可逆出），UI 据此展示"已暂停自动重试"。 */
-  async markExhausted(resumeIntentId: string, lastError: string, options?: { now?: number }): Promise<ResumeIntent | null> {
+  async markExhausted(
+    resumeIntentId: string,
+    lastError: string,
+    options?: { now?: number },
+  ): Promise<ResumeIntent | null> {
     await this.ensureReady();
     const now = options?.now ?? Date.now();
     const res = this.getDatabase()
@@ -335,23 +343,32 @@ export class ResumeIntentRepo {
   }
 
   /**
-   * 派发前守卫的重排（不消耗 attempt）：dispatched 行回到 pending 并推迟 nextEligibleAt。
+   * 派发前守卫的重排（不消耗 attempt）：dispatched 行回到 pending 并推迟 nextEligibleAt；
+   * 可选改写 kind（如 transient→quota：限流重试时发现额度其实已耗尽，转等重置/核销卡）。
    * 与 requeueAfterFailure 的区别：这是"还没真正派发"的守卫退避（如额度未恢复），不算一次尝试。
    */
   async reschedulePending(
     resumeIntentId: string,
     nextEligibleAt: number,
-    options?: { now?: number },
+    options?: { now?: number; kind?: ResumeIntentKind },
   ): Promise<ResumeIntent | null> {
     await this.ensureReady();
     const now = options?.now ?? Date.now();
     const res = this.getDatabase()
       .prepare(
         `UPDATE resume_intents
-        SET status = 'pending', next_eligible_at = @next_eligible_at, updated_at = @now
+        SET status = 'pending',
+            next_eligible_at = @next_eligible_at,
+            ${options?.kind ? "kind = @kind," : ""}
+            updated_at = @now
         WHERE resume_intent_id = @id AND status = 'dispatched'`,
       )
-      .run({ id: resumeIntentId, next_eligible_at: nextEligibleAt, now });
+      .run({
+        id: resumeIntentId,
+        next_eligible_at: nextEligibleAt,
+        ...(options?.kind ? { kind: options.kind } : {}),
+        now,
+      });
     if (res.changes !== 1) return null;
     return rowToIntent(this.getRow(resumeIntentId)!);
   }
@@ -392,7 +409,9 @@ export class ResumeIntentRepo {
   async listPending(): Promise<ResumeIntent[]> {
     await this.ensureReady();
     const rows = this.getDatabase()
-      .prepare(`SELECT * FROM resume_intents WHERE status = 'pending' ORDER BY next_eligible_at ASC`)
+      .prepare(
+        `SELECT * FROM resume_intents WHERE status = 'pending' ORDER BY next_eligible_at ASC`,
+      )
       .all() as unknown as ResumeIntentRow[];
     return rows.map(rowToIntent);
   }

@@ -68,10 +68,11 @@ export function createInitialWatchdogStatus(): WatchdogRuntimeStatus {
 }
 
 /** 快照抛错（订阅未知/账号切换）时维持原状态与节奏（spec §3.1：保留 last-good，不清态）。 */
-export function transitionOnObservationError(
-  prev: WatchdogRuntimeStatus,
-): WatchdogTransition {
-  return { status: { ...prev, wakeAt: prev.state === "waiting_reset" ? prev.wakeAt : null }, quotaRestored: false };
+export function transitionOnObservationError(prev: WatchdogRuntimeStatus): WatchdogTransition {
+  return {
+    status: { ...prev, wakeAt: prev.state === "waiting_reset" ? prev.wakeAt : null },
+    quotaRestored: false,
+  };
 }
 
 /**
@@ -136,7 +137,10 @@ export function transitionWatchdogState(
         return restored(prev.exhaustionCycleId);
       }
       if (remaining <= QUOTA_WATCHDOG_CLAIM_THRESHOLD_PERCENT && observation.hasClaimableCard) {
-        return { status: { ...prev, ...lastGood, state: "claiming", wakeAt: null }, quotaRestored: false };
+        return {
+          status: { ...prev, ...lastGood, state: "claiming", wakeAt: null },
+          quotaRestored: false,
+        };
       }
       if (remaining <= 0) {
         return {
@@ -222,11 +226,7 @@ export function shouldAttemptOpportunityCall(
   cooldownUntil: number,
   now: number,
 ): boolean {
-  const activeStates: ReadonlyArray<QuotaWatchdogState> = [
-    "watching",
-    "claiming",
-    "waiting_reset",
-  ];
+  const activeStates: ReadonlyArray<QuotaWatchdogState> = ["watching", "claiming", "waiting_reset"];
   return activeStates.includes(state) && now >= cooldownUntil;
 }
 
@@ -291,4 +291,121 @@ export function resolveClaimTarget(
   if (usable(snapshot.availableFiveHourResets)) return "FIVE_HOUR";
   if (usable(snapshot.availableWeekResets)) return "WEEK";
   return null;
+}
+
+// ---- v2 修订（docs/quota-watchdog/spec.md §3.6）：额度口径反转 + Host 侧失败归因 ----
+
+/**
+ * entitlement 快照的 remaining.percentage 承袭 quota 接口的"已用占比"（0–100），
+ * 与 UI codingPlanQuotaPresentation.getQuotaRemainingPercentage 同口径反转为剩余占比。
+ * v1 直接把它当剩余值比较，导致耗尽判定永不成立（watchdog 永远 idle、reset 卡从未被核销）。
+ */
+export function remainingPercentFromEntitlement(
+  percentage: number | null | undefined,
+): number | null {
+  if (typeof percentage !== "number" || !Number.isFinite(percentage)) {
+    return null;
+  }
+  const used = Math.max(0, Math.min(100, percentage));
+  return Math.max(0, Math.min(100, 100 - used));
+}
+
+/** 套餐到期类（重置卡救不了，禁止自动核销，交还用户）。 */
+export const RESUME_PLAN_EXPIRED_CODES: ReadonlySet<string> = new Set(["1309"]);
+/** 终端额度类：用量/周期上限，必须等重置或核销卡（bigmodel-business-error-retry.md）。 */
+export const RESUME_USAGE_LIMIT_CODES: ReadonlySet<string> = new Set([
+  "1005",
+  "1304",
+  "1308",
+  "1310",
+  "1313",
+  "1316",
+  "1317",
+  "1318",
+  "1319",
+  "1320",
+  "1321",
+  "insufficient_quota",
+  "credit_balance_exhausted",
+  "organization_spend_limit_exceeded",
+  "project_spend_limit_exceeded",
+  "organization_usage_limit_exceeded",
+  "exceeded_current_quota_error",
+]);
+/** 限流/过载类：轮内重试预算耗尽后按短退避自动续跑（1305 = 平台流量限制）。 */
+export const RESUME_RATE_LIMIT_CODES: ReadonlySet<string> = new Set([
+  "429",
+  "3002",
+  "2007",
+  "1302",
+  "1303",
+  "1305",
+  "1312",
+  "rate_limit_reached_error",
+  "rate_limit_error",
+  "overloaded_error",
+  "engine_overloaded_error",
+]);
+/** 上下文溢出类（1261 等）：先 /compact 再续跑一次。 */
+export const RESUME_CONTEXT_OVERFLOW_CODES: ReadonlySet<string> = new Set(["1261"]);
+
+export type ResumeFailureClassification = "quota" | "plan_expired" | "context" | "transient";
+
+/**
+ * Host 侧权威失败归因（renderer 只上报事实，归属以此为准）。
+ * 优先级：code 明示类别 > attribution.reason > source=network > 消息文本兜底。
+ * 返回 null 表示无法归因，调用方按意图原 kind 兜底处理。
+ */
+export function classifyTurnFailure(input: {
+  code?: string | null;
+  message?: string | null;
+  attributionReason?: string | null;
+  source?: string | null;
+}): ResumeFailureClassification | null {
+  const code = input.code?.trim() ?? "";
+  if (code) {
+    if (RESUME_PLAN_EXPIRED_CODES.has(code)) return "plan_expired";
+    if (RESUME_USAGE_LIMIT_CODES.has(code)) return "quota";
+    if (RESUME_CONTEXT_OVERFLOW_CODES.has(code)) return "context";
+    if (RESUME_RATE_LIMIT_CODES.has(code)) return "transient";
+  }
+  if (input.attributionReason === "quota_exhausted") return "quota";
+  if (input.attributionReason === "context_exceeded") return "context";
+  if (input.source === "network") return "transient";
+  const message = (input.message ?? "").toLowerCase();
+  if (!message) return null;
+  if (
+    /context (length|window|overflow)|context exceeded|compact (failed|rapid refill)|token limit/.test(
+      message,
+    )
+  ) {
+    return "context";
+  }
+  if (/plan (has )?expired|subscription expired/.test(message)) return "plan_expired";
+  if (/exceed (quota )?limit|quota exceeded|insufficient quota|credit balance/.test(message)) {
+    return "quota";
+  }
+  if (
+    /rate limit|too many requests|overloaded|timeout|timed out|network|econn|fetch failed/.test(
+      message,
+    )
+  ) {
+    return "transient";
+  }
+  return null;
+}
+
+/**
+ * 失败类别 → 派发前是否允许核销重置卡：只有终端额度类（quota）允许烧卡；
+ * plan_expired / context / transient 一律不烧（卡是稀缺资源，1305 等限流等 1 分钟即可恢复）。
+ */
+export function claimTargetForFailure(
+  classification: ResumeFailureClassification | null,
+  snapshot: CodingPlanResetStatusSnapshot,
+  now: number,
+): CodingPlanResetType | null {
+  if (classification !== "quota" && classification !== null) {
+    return null;
+  }
+  return resolveClaimTarget(snapshot, now);
 }

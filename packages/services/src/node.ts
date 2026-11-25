@@ -388,11 +388,14 @@ export {
   type QuotaWatchdogServiceDeps,
 } from "./usage-stats/quotaWatchdogService.js";
 export {
+  claimTargetForFailure,
+  classifyTurnFailure,
   computeWakeDelayMs,
   createInitialWatchdogStatus,
   isOpportunityThrottleError,
   isOpportunityTransientError,
   nextOpportunityCooldownUntil,
+  remainingPercentFromEntitlement,
   resolveClaimTarget,
   shouldAttemptOpportunityCall,
   transitionOnObservationError,
@@ -586,7 +589,10 @@ import {
   type QuotaResumeDispatchPort,
 } from "./usage-stats/quotaWatchdogService.js";
 import { ResumeIntentRepo } from "./session/resumeIntentRepo.js";
-import { sendHostCasCommandV4 } from "./zcode-agent/zcodeV4HostCommand.js";
+import {
+  createHostCommandEnvelope,
+  sendHostCasCommandV4,
+} from "./zcode-agent/zcodeV4HostCommand.js";
 import type { CodingPlanResetScopeRequest } from "@zcode/shared";
 import { createCodingPlanSubscriptionService } from "./coding-plan-subscription/codingPlanSubscriptionService.js";
 import { createClientConfigService } from "./client-config/clientConfigService.js";
@@ -2835,6 +2841,12 @@ export function createLocalServices(options: {
       ),
     afterChange: publishProjectChange,
   });
+  // 配额守护自动续跑：用户手动发送 prompt 即取消该 task 的在途自动续跑意图（spec §3.4
+  // "新消息/编辑即取消"；v2 修订：v1 从未接线，自动续跑会抢在用户手动 continue 之前重复派发）。
+  // 适配器构造早于 watchdog，经 ref 后接线；watchdog 未装配时为 no-op。
+  const quotaWatchdogUserCancelRef: {
+    current: (params: { taskId: string; reason: string }) => Promise<void>;
+  } = { current: async () => {} };
   // task wrapper 由 ZCode task service adapter 提供；核心 session 状态由 ZCode agent server 维护。
   const zcodeTaskService = createZCodeTaskServiceAdapter({
     zcodeAgentService,
@@ -2842,6 +2854,11 @@ export function createLocalServices(options: {
     taskIndexSyncer: zcodeTaskIndexSyncer,
     settingService,
     cuaProductMcpServerResolver,
+    onManualPromptSubmitted: (params) => {
+      void quotaWatchdogUserCancelRef
+        .current({ taskId: params.taskId, reason: "user_manual_input" })
+        .catch(() => undefined);
+    },
   });
   appControlService = createAppControlService({
     sourceServerId: options?.projectStorageHostId ?? "local",
@@ -3127,6 +3144,7 @@ export function createLocalServices(options: {
               workspacePath,
               ...(workspaceIdentity ? { workspaceIdentity } : {}),
             });
+            // persist status："running" 即有在途 turn（completed/error/idle 均可派发）。
             return meta?.status === "running";
           },
           retryTurn: async ({
@@ -3158,25 +3176,62 @@ export function createLocalServices(options: {
               resumeIntentId,
             });
           },
-          awaitTurnOutcome: ({ sessionId, timeoutMs }) =>
+          requestCompact: async ({ sessionId, workspacePath, workspaceIdentity }) => {
+            // v4 compact 是非 CAS 输入型命令（idle 立即执行 / busy 进 FIFO），无需 baseRevision。
+            await zcodeAgentService.sendConversationCommandV4({
+              workspacePath,
+              ...(workspaceIdentity ? { workspaceIdentity } : {}),
+              envelope: createHostCommandEnvelope({
+                type: "compact",
+                payload: {},
+                sessionId,
+              }),
+            });
+          },
+          awaitTurnOutcome: ({ sessionId, workspacePath, workspaceIdentity, timeoutMs }) =>
             new Promise((resolve) => {
               let settled = false;
               const settle = (value: {
                 outcome: "completed" | "failed";
                 errorMessage?: string;
+                errorCode?: string | null;
+                attributionReason?: string | null;
               }) => {
                 if (settled) return;
                 settled = true;
                 clearTimeout(timer);
-                disposable.dispose();
+                streamDisposable.dispose();
+                terminalDisposable.dispose();
                 resolve(value);
               };
-              const disposable = zcodeTaskService.onDynamicStreamEvent(sessionId)((event) => {
+              // v2 修正：v1 订阅 onDynamicStreamEvent(sessionId) 收不到事件（流按 workspace 路由，
+              // 结局等待全超时 → 每轮恰好 1h 后才回队）。改为 workspace 维度流订阅 + 终态订阅双通道，
+              // 后者基于 task index 常开订阅，renderer 是否观看均可靠。
+              const streamDisposable = zcodeTaskService.onDynamicTaskEvent({
+                workspacePath,
+                ...(workspaceIdentity ? { workspaceIdentity } : {}),
+                taskId: sessionId,
+              })((event) => {
                 if (event.type === "task_complete") {
                   settle({ outcome: "completed" });
                 } else if (event.type === "task_error") {
-                  settle({ outcome: "failed", errorMessage: event.error });
+                  settle({
+                    outcome: "failed",
+                    errorMessage: event.error,
+                    errorCode: event.code ?? null,
+                    attributionReason: event.attribution?.reason ?? null,
+                  });
                 }
+              });
+              const terminalDisposable = zcodeTaskService.onDynamicTaskTerminalOutcome(sessionId)((
+                terminal,
+              ) => {
+                if (terminal.outcome === "succeeded") {
+                  settle({ outcome: "completed" });
+                } else if (terminal.outcome === "failed") {
+                  settle({ outcome: "failed", errorMessage: terminal.error });
+                }
+                // stopped：用户主动停止——意图由用户活动钩子取消，这里不收口。
               });
               const timer = setTimeout(
                 () => settle({ outcome: "failed", errorMessage: "dispatch outcome timeout" }),
@@ -3204,6 +3259,8 @@ export function createLocalServices(options: {
             error: error instanceof Error ? error.message : String(error),
           });
         });
+        // 用户手动输入 → 取消在途自动续跑意图（后接线，见上方 ref 声明处注释）。
+        quotaWatchdogUserCancelRef.current = quotaWatchdog.cancelAutoResume.bind(quotaWatchdog);
         return Object.assign(usageStatsServiceImpl, {
           reportAutoResumeFailure: quotaWatchdog.reportAutoResumeFailure.bind(quotaWatchdog),
           cancelAutoResume: quotaWatchdog.cancelAutoResume.bind(quotaWatchdog),

@@ -28,8 +28,11 @@ export const QUOTA_WATCHDOG_DEFAULT_SETTINGS: QuotaWatchdogSettings = {
   autoResumeMaxConsecutive: 5,
 };
 
-/** 续跑意图类别：quota=等待套餐配额重置；transient=退避阶梯重试。 */
-export type ResumeIntentKind = "quota" | "transient";
+/**
+ * 续跑意图类别：quota=等待套餐配额重置（可自动核销重置卡）；transient=限流/网络退避阶梯重试；
+ * context=上下文溢出，先请求 /compact 再续跑一次（v2 修订，docs/quota-watchdog/spec.md §3.6）。
+ */
+export type ResumeIntentKind = "quota" | "transient" | "context";
 
 export type ResumeIntentStatus = "pending" | "dispatched" | "cancelled" | "exhausted";
 
@@ -38,6 +41,9 @@ export const RESUME_TRANSIENT_BACKOFF_MS = [60_000, 300_000, 900_000] as const;
 
 /** 额度类意图的唤醒裕量：nextResetTime 之后再多等这段时间才派发（抵消服务端计时误差）。 */
 export const RESUME_QUOTA_WAKE_MARGIN_MS = 60_000;
+
+/** context 意图发出 /compact 后的重试间隔：等 compact 维护 turn 落地再续跑。 */
+export const RESUME_CONTEXT_COMPACT_DELAY_MS = 20_000;
 
 /**
  * 一条自动续跑意图。每 task 至多一条 pending（sqlite 部分唯一索引关闭 TOCTOU）；
@@ -81,7 +87,9 @@ export interface QuotaWatchdogStatus {
 }
 
 /** 归一化阈值设置输入：非法值回落默认，不抛错（设置面板手输场景）。 */
-export function normalizeQuotaWatchdogSettings(raw: Partial<QuotaWatchdogSettings>): QuotaWatchdogSettings {
+export function normalizeQuotaWatchdogSettings(
+  raw: Partial<QuotaWatchdogSettings>,
+): QuotaWatchdogSettings {
   const clampInt = (value: unknown, min: number, max: number, fallback: number): number => {
     const parsed = typeof value === "number" && Number.isFinite(value) ? Math.round(value) : NaN;
     if (Number.isNaN(parsed) || parsed < min || parsed > max) {

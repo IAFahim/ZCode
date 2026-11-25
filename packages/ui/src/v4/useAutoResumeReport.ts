@@ -94,19 +94,26 @@ export function useAutoResumeReport(params: {
       return;
     }
     // 失败事实进入 Host 后由看门狗去重与调度；这里只保证一次失败上报一次。
+    // v2：透传 provider 业务码 / CLI 归因，Host 侧做权威归类（1309 禁烧卡、1261 先压缩、1305 短退避）。
     void usageStatsService
       .reportAutoResumeFailure({
         taskId: sessionId,
         workspacePath,
-        ...(params.workspaceIdentity?.trim() ? { workspaceIdentity: params.workspaceIdentity } : {}),
+        ...(params.workspaceIdentity?.trim()
+          ? { workspaceIdentity: params.workspaceIdentity }
+          : {}),
         kind,
         errorMessage: error.message,
         nextResetTime: null,
         failedRowTarget: null,
+        providerErrorCode: error.attribution?.providerErrorCode?.trim() || error.code || null,
+        attributionReason: error.attribution?.reason ?? null,
       })
       .then(() => {
         toast(
-          intl.formatMessage({ id: kind === "quota" ? "chat.autoResume.armedQuota" : "chat.autoResume.armedTransient" }),
+          intl.formatMessage({
+            id: kind === "quota" ? "chat.autoResume.armedQuota" : "chat.autoResume.armedTransient",
+          }),
           { variant: "info" },
         );
       })
@@ -116,5 +123,14 @@ export function useAutoResumeReport(params: {
           error: reportError instanceof Error ? reportError.message : String(reportError),
         });
       });
-  }, [intl, params.error, params.errorKey, params.providerId, params.sessionId, params.usageStatsService, params.workspaceIdentity, params.workspacePath]);
+  }, [
+    intl,
+    params.error,
+    params.errorKey,
+    params.providerId,
+    params.sessionId,
+    params.usageStatsService,
+    params.workspaceIdentity,
+    params.workspacePath,
+  ]);
 }

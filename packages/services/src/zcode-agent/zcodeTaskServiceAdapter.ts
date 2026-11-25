@@ -192,6 +192,12 @@ interface CreateZCodeTaskServiceAdapterOptions {
   taskIndexSyncer: ZCodeTaskIndexSyncer;
   settingService?: Pick<ISettingService, "get">;
   cuaProductMcpServerResolver?: CuaProductMcpServerResolver;
+  /**
+   * 用户手动 prompt 提交回调（v2：配额守护自动续跑的取消信号源，spec §3.4）。
+   * 仅无后台归因（automationId/offPeakTaskId/resumeIntentId 均缺省）的 prompt 触发；
+   * 自动续跑/定时/闲时派发不触发，避免看门狗取消自己。
+   */
+  onManualPromptSubmitted?: (params: { taskId: string; workspacePath: string }) => void;
 }
 
 interface TaskTarget {
@@ -2101,7 +2107,7 @@ export function createZCodeTaskServiceAdapter(
         ...storedTarget,
         ...(params.remoteSessionId ? { remoteSessionId: params.remoteSessionId } : {}),
       };
-      return sendPromptToAgent(target, {
+      const ack = await sendPromptToAgent(target, {
         traceId: params.traceId,
         queryId: params.queryId,
         messageId: params.messageId,
@@ -2115,6 +2121,15 @@ export function createZCodeTaskServiceAdapter(
         modelSelection: params.modelSelection,
         modelExecution: params.modelExecution,
       });
+      // 手动 prompt（无后台归因）提交即视为用户接管：看门狗取消该 task 的在途自动续跑意图，
+      // 防止自动派发抢在用户手动 continue 之前重复发送（spec §3.4 取消规则）。
+      if (!params.automationId && !params.offPeakTaskId && !params.resumeIntentId) {
+        options.onManualPromptSubmitted?.({
+          taskId: params.taskId,
+          workspacePath: target.workspacePath,
+        });
+      }
+      return ack;
     },
 
     async deliverSessionMessage(

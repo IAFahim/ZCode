@@ -1,6 +1,5 @@
-import { randomUUID } from "node:crypto";
 import {
-  RESUME_QUOTA_WAKE_MARGIN_MS,
+  RESUME_CONTEXT_COMPACT_DELAY_MS,
   normalizeQuotaWatchdogSettings,
   QUOTA_WATCHDOG_DEFAULT_SETTINGS,
   type CodingPlanResetScopeRequest,
@@ -8,6 +7,7 @@ import {
   type QuotaWatchdogSettings,
   type QuotaWatchdogStatus,
   type ResumeIntent,
+  type ResumeIntentKind,
 } from "@zcode/shared";
 import { createServiceLogger } from "#src/logger/serviceLogger.js";
 import {
@@ -18,11 +18,10 @@ import {
 import type { ISettingService } from "#src/setting/setting.js";
 import type { IUsageStatsService } from "./usageStats.js";
 import {
+  classifyTurnFailure,
   computeWakeDelayMs,
   createInitialWatchdogStatus,
-  isOpportunityTransientError,
-  isOpportunityThrottleError,
-  nextOpportunityCooldownUntil,
+  remainingPercentFromEntitlement,
   resolveClaimTarget,
   shouldAttemptOpportunityCall,
   transitionOnObservationError,
@@ -30,6 +29,16 @@ import {
   watchdogPollDelayMs,
   type WatchdogRuntimeStatus,
 } from "./quotaWatchdogDomain.js";
+import {
+  createEmptyClaimBookkeeping,
+  createQuotaResumeClaim,
+  type QuotaResumeClaim,
+} from "./quotaResumeClaim.js";
+import {
+  createQuotaResumeGate,
+  SELF_COMPACT_ACTIVE_WINDOW_MS,
+  type QuotaResumeGate,
+} from "./quotaResumeGate.js";
 
 // 配额守护与自动续跑（docs/quota-watchdog/spec.md）：
 // Host 进程内唯一运行态所有者。renderer 只读展示（横幅/设置），不保存任何已接纳状态。
@@ -43,10 +52,16 @@ import {
 const TURN_OUTCOME_TIMEOUT_MS = 60 * 60_000;
 /** nextResetTime 未知时额度类意图的兜底重试间隔。 */
 const QUOTA_FALLBACK_RETRY_MS = 10 * 60_000;
-/** /use 后 status 对账重试阶梯（与 renderer hook USE_STATUS_RETRY_DELAYS_MS 同值）。 */
-const USE_CONFIRM_RETRY_DELAYS_MS = [0, 250, 750, 1_500] as const;
 /** checkpoint 单行 key（quota_watchdog_checkpoint 表）。 */
 const CHECKPOINT_KEY = "watchdog";
+
+/** 派发 turn 结局：失败时携带归因线索（code/attribution.reason）供结算权威归类。 */
+export interface TurnOutcomeWaitResult {
+  outcome: "completed" | "failed";
+  errorMessage?: string;
+  errorCode?: string | null;
+  attributionReason?: string | null;
+}
 
 export interface QuotaResumeDispatchPort {
   /** 目标 task 是否正在运行/流式（用户已自行活动时不派发，转为取消）。 */
@@ -70,11 +85,22 @@ export interface QuotaResumeDispatchPort {
     workspaceIdentity?: string;
     resumeIntentId: string;
   }): Promise<void>;
-  /** 等待该 session 下一个 turn 终态（task_complete / task_error）；超时按 failed 收口。 */
+  /** v4 compact 维护命令（idle 立即执行 / busy 进 FIFO），context 溢出先压缩再续跑。 */
+  requestCompact(input: {
+    sessionId: string;
+    workspacePath: string;
+    workspaceIdentity?: string;
+  }): Promise<void>;
+  /**
+   * 等待该 session 下一个 turn 终态（task_complete / task_error）；超时按 failed 收口。
+   * v2：task_error 携带 code/attribution.reason，结算据此权威归类（不依赖 renderer 上报）。
+   */
   awaitTurnOutcome(input: {
     sessionId: string;
+    workspacePath: string;
+    workspaceIdentity?: string;
     timeoutMs?: number;
-  }): Promise<{ outcome: "completed" | "failed"; errorMessage?: string }>;
+  }): Promise<TurnOutcomeWaitResult>;
 }
 
 export interface QuotaWatchdogServiceDeps {
@@ -96,44 +122,86 @@ function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 export class QuotaWatchdogService {
   private status: WatchdogRuntimeStatus = createInitialWatchdogStatus();
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
   private disposed = false;
-  /** /opportunity 冷却与幂等 key 簿记（service 自持；renderer Coordinator 状态独立）。 */
-  private opportunityCooldownUntil = 0;
-  private opportunityIdempotencyKey: string | null = null;
-  /** /use 对账进行中：期间绝不调用 /opportunity（发卡锁互斥，spec §3.2）。 */
-  private useInFlight = false;
-  private useIdempotencyKey: string | null = null;
+  /** /opportunity 与 /use 簿记（唯一实例由本 service 持有；逻辑在 quotaResumeClaim）。 */
+  private readonly claimBookkeeping = createEmptyClaimBookkeeping();
+  /** 核销/机会逻辑（claimResets / requestOpportunity）。 */
+  private readonly claim: QuotaResumeClaim;
   /** 上次观测到的可认领卡事实；status 拉取失败时复用，避免误判落到 waiting_reset。 */
   private lastClaimableCard = false;
   /** 失败上报时暂存的 failed 行目标（retryTurn 用）；成功/取消后清除。 */
   private readonly failedRowTargets = new Map<string, { rowId: number; entityId: string }>();
   /** 在途派发结局等待（taskId → promise），tick 不重复派发同一 task。 */
   private readonly pendingOutcomes = new Map<string, Promise<void>>();
+  /** v2：同 task 失败上报/结算串行化（消除 upsert 与 requeue 的 UNIQUE 竞态与 attempt 双计）。 */
+  private readonly taskLocks = new Map<string, Promise<void>>();
+  /** v2：已对 task 发起过 /compact 的 context 意图（第二次 context 失败即 exhausted）。 */
+  private readonly contextCompactArmed = new Set<string>();
+  /** v2：自发 compact 活动窗口（窗口内 isTaskActive 视为己方活动，守卫重排而非取消意图）。 */
+  private readonly selfCompactUntil = new Map<string, number>();
+  /** v2 派发门（quotaResumeGate）：核销前置 + 不盲放行；意图簿记经回调注入。 */
+  private readonly gate: QuotaResumeGate;
 
-  constructor(private readonly deps: QuotaWatchdogServiceDeps) {}
+  constructor(private readonly deps: QuotaWatchdogServiceDeps) {
+    this.claim = createQuotaResumeClaim(deps.usageStatsService, this.claimBookkeeping);
+    this.gate = createQuotaResumeGate({
+      resumeIntentRepo: deps.resumeIntentRepo,
+      usageStatsService: deps.usageStatsService,
+      claimResetCard: (snapshot, scope) => this.claim.claimResets(snapshot, scope),
+      requestCompact: (input) => this.deps.dispatch.requestCompact(input),
+      isContextCompactArmed: (taskId) => this.contextCompactArmed.has(taskId),
+      armContextCompact: (taskId) => this.contextCompactArmed.add(taskId),
+      markSelfCompactActivity: (taskId) =>
+        this.selfCompactUntil.set(taskId, Date.now() + SELF_COMPACT_ACTIVE_WINDOW_MS),
+      scheduleNextTick: () => this.scheduleNextTick(),
+    });
+  }
 
-  /** Host 启动恢复：回收崩溃实例的 dispatched 行 + 重挂 checkpoint，再启动循环。 */
+  /** 同 task 串行执行（v2）：renderer 失败上报与派发结算竞态是 v1 UNIQUE 崩溃与计数漂移根因。 */
+  private withTaskLock<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.taskLocks.get(taskId) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    const tail = next.catch(() => undefined).then(() => undefined);
+    this.taskLocks.set(taskId, tail);
+    void tail.then(() => {
+      if (this.taskLocks.get(taskId) === tail) {
+        this.taskLocks.delete(taskId);
+      }
+    });
+    return next;
+  }
+
+  /** Host 启动恢复：回收崩溃实例的 dispatched 行 + 重挂 checkpoint，再启动循环。
+   *  v2：两步恢复各自收错——v1 一处抛错（如迁移期 UNIQUE）会连带跳过 checkpoint 重挂。 */
   async init(): Promise<void> {
     try {
       await this.deps.resumeIntentRepo.recoverStaleDispatched(Date.now());
+    } catch (error) {
+      serviceLogger.warn("watchdog init stale recovery failed", {
+        error: toErrorMessage(error),
+      });
+    }
+    try {
       const raw = await this.deps.resumeIntentRepo.getCheckpoint(CHECKPOINT_KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as WatchdogCheckpointPayload;
         if (parsed?.status?.state) {
           // 重启后 restored 不能重发：quotaRestored 只由状态机迁移产生，checkpoint 仅恢复观测底座。
-          this.status = { ...createInitialWatchdogStatus(), ...parsed.status, state: parsed.status.state === "restored" ? "idle" : parsed.status.state };
+          this.status = {
+            ...createInitialWatchdogStatus(),
+            ...parsed.status,
+            state: parsed.status.state === "restored" ? "idle" : parsed.status.state,
+          };
         }
       }
     } catch (error) {
-      serviceLogger.warn("watchdog init recovery failed", { error: toErrorMessage(error) });
+      serviceLogger.warn("watchdog init checkpoint restore failed", {
+        error: toErrorMessage(error),
+      });
     }
     this.ensureLoop();
   }
@@ -156,6 +224,8 @@ export class QuotaWatchdogService {
     errorMessage: string;
     nextResetTime: number | null;
     failedRowTarget?: { rowId: number; entityId: string } | null;
+    providerErrorCode?: string | null;
+    attributionReason?: string | null;
   }): Promise<void> {
     const settings = await this.readSettings();
     if (!settings.autoResumeEnabled) {
@@ -164,36 +234,60 @@ export class QuotaWatchdogService {
     if (params.failedRowTarget) {
       this.failedRowTargets.set(params.taskId, params.failedRowTarget);
     }
-    try {
-      const now = Date.now();
-      const nextEligibleAt =
-        params.kind === "quota"
-          ? quotaEligibleAt(params.nextResetTime ?? now, now)
-          : (nextTransientEligibleAt(0, now) ?? now + QUOTA_FALLBACK_RETRY_MS);
-      const intent = await this.deps.resumeIntentRepo.upsertPending(
-        {
-          taskId: params.taskId,
-          workspacePath: params.workspacePath,
-          workspaceIdentity: params.workspaceIdentity,
-          kind: params.kind,
-          nextEligibleAt,
-          lastError: params.errorMessage,
-        },
-        { now },
-      );
-      serviceLogger.info("resume intent recorded", {
+    // v2 权威归因：provider 业务码 > attribution.reason > 上报方粗分类。
+    // plan_expired（1309）无自动动作，直接丢弃上报，绝不建意图/烧卡。
+    const classified = classifyTurnFailure({
+      code: params.providerErrorCode ?? null,
+      message: params.errorMessage,
+      attributionReason: params.attributionReason ?? null,
+      source: null,
+    });
+    if (classified === "plan_expired") {
+      serviceLogger.info("resume report dropped, plan expired has no auto action", {
         taskId: params.taskId,
-        kind: params.kind,
-        attempt: intent.attempt,
-        nextEligibleAt,
+        code: params.providerErrorCode ?? null,
       });
-      this.ensureLoop();
-    } catch (error) {
-      serviceLogger.warn("resume intent record failed", {
-        taskId: params.taskId,
-        error: toErrorMessage(error),
-      });
+      return;
     }
+    const kind: ResumeIntentKind =
+      classified === "context"
+        ? "context"
+        : ((classified as ResumeIntentKind | null) ?? params.kind);
+    await this.withTaskLock(params.taskId, async () => {
+      try {
+        const now = Date.now();
+        const nextEligibleAt =
+          kind === "quota"
+            ? quotaEligibleAt(params.nextResetTime ?? now, now)
+            : kind === "context"
+              ? now + RESUME_CONTEXT_COMPACT_DELAY_MS
+              : (nextTransientEligibleAt(0, now) ?? now + QUOTA_FALLBACK_RETRY_MS);
+        // incrementAttempt=false：本次上报与派发结算描述同一次失败，attempt 由结算路径统一推进。
+        const intent = await this.deps.resumeIntentRepo.upsertPending(
+          {
+            taskId: params.taskId,
+            workspacePath: params.workspacePath,
+            workspaceIdentity: params.workspaceIdentity,
+            kind,
+            nextEligibleAt,
+            lastError: params.errorMessage,
+          },
+          { now, incrementAttempt: false },
+        );
+        serviceLogger.info("resume intent recorded", {
+          taskId: params.taskId,
+          kind,
+          attempt: intent.attempt,
+          nextEligibleAt,
+        });
+        this.ensureLoop();
+      } catch (error) {
+        serviceLogger.warn("resume intent record failed", {
+          taskId: params.taskId,
+          error: toErrorMessage(error),
+        });
+      }
+    });
   }
 
   async cancelAutoResume(params: { taskId: string; reason: string }): Promise<void> {
@@ -265,10 +359,13 @@ export class QuotaWatchdogService {
     if (this.timer) {
       clearTimeout(this.timer);
     }
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      void this.tick();
-    }, Math.max(delayMs, 0));
+    this.timer = setTimeout(
+      () => {
+        this.timer = null;
+        void this.tick();
+      },
+      Math.max(delayMs, 0),
+    );
   }
 
   private async tick(): Promise<void> {
@@ -317,7 +414,11 @@ export class QuotaWatchdogService {
     let scope: CodingPlanResetScopeRequest | null = null;
     try {
       const snapshot = await this.deps.usageStatsService.getEntitlementSnapshot();
-      observation.remainingPercent = snapshot.remaining?.percentage ?? null;
+      // v2 口径修正：快照 percentage 是"已用占比"，状态机/节奏全部消费"剩余占比"。
+      // v1 未反转 → watching 进入线（≤10%）永不成立 → watchdog 永远 idle、reset 卡从未自动核销。
+      observation.remainingPercent = remainingPercentFromEntitlement(
+        snapshot.remaining?.percentage,
+      );
       observation.nextResetTime = snapshot.remaining?.nextResetTime ?? null;
       scope = await this.deps.resolveResetScope();
       if (scope) {
@@ -368,145 +469,34 @@ export class QuotaWatchdogService {
       scope &&
       settings.autoClaimResetCardsEnabled &&
       this.status.state === "claiming" &&
-      !this.useInFlight
+      !this.claimBookkeeping.useInFlight
     ) {
-      await this.claimResets(resetSnapshot, scope);
+      await this.claim.claimResets(resetSnapshot, scope);
     } else if (
       resetSnapshot &&
       scope &&
       settings.autoClaimResetCardsEnabled &&
-      !this.useInFlight &&
-      shouldAttemptOpportunityCall(this.status.state, this.opportunityCooldownUntil, now)
+      !this.claimBookkeeping.useInFlight &&
+      shouldAttemptOpportunityCall(
+        this.status.state,
+        this.claimBookkeeping.opportunityCooldownUntil,
+        now,
+      )
     ) {
       // 主动状态无卡：补位触发服务端资格判断（renderer hidden 时无人触发，spec §3.2）。
-      await this.requestOpportunity(scope);
+      await this.claim.requestOpportunity(scope);
     }
 
     // ---- 派发到期意图 ----
     if (settings.autoResumeEnabled) {
       const claimed = await this.deps.resumeIntentRepo.claimDue(Date.now());
       for (const intent of claimed) {
-        if (intent.kind === "quota") {
-          // 派发门（tech-design §5）：事件与快照之间可能有新消耗/重置漂移，
-          // 派发前必须用 live 快照证实额度已恢复；未恢复则守卫重排（不消耗 attempt）。
-          try {
-            const fresh = await this.deps.usageStatsService.getEntitlementSnapshot();
-            const remaining = fresh.remaining?.percentage ?? null;
-            if (remaining !== null && remaining <= 0) {
-              const base = fresh.remaining?.nextResetTime ?? Date.now() + QUOTA_FALLBACK_RETRY_MS;
-              await this.deps.resumeIntentRepo.reschedulePending(
-                intent.resumeIntentId,
-                quotaEligibleAt(base, Date.now()),
-              );
-              serviceLogger.info("quota intent deferred, quota not restored yet", {
-                taskId: intent.taskId,
-                remaining,
-              });
-              continue;
-            }
-          } catch (error) {
-            // 快照失败不阻塞派发（下一轮失败结算会再兜底）。
-            serviceLogger.warn("quota dispatch gate snapshot failed", {
-              taskId: intent.taskId,
-              error: toErrorMessage(error),
-            });
-          }
-        }
-        void this.dispatchIntent(intent, settings);
-      }
-    }
-  }
-
-  private async claimResets(
-    resetSnapshot: CodingPlanResetStatusSnapshot,
-    scope: CodingPlanResetScopeRequest,
-  ): Promise<void> {
-    const now = Date.now();
-    const resetType = resolveClaimTarget(resetSnapshot, now);
-    if (!resetType) {
-      return;
-    }
-    // 对账后无可核销机会即放弃，不携带新幂等键重试（与 renderer 强制对账同语义）。
-    let fresh: CodingPlanResetStatusSnapshot;
-    try {
-      fresh = await this.deps.usageStatsService.getCodingPlanResetStatus(scope);
-    } catch (error) {
-      serviceLogger.warn("pre-use reconciliation failed", { error: toErrorMessage(error) });
-      return;
-    }
-    const stillClaimable = resolveClaimTarget(fresh, Date.now());
-    if (stillClaimable !== resetType) {
-      return;
-    }
-    const idempotencyKey = this.useIdempotencyKey ?? randomUUID();
-    this.useIdempotencyKey = idempotencyKey;
-    this.useInFlight = true;
-    try {
-      await this.deps.usageStatsService.useCodingPlanReset({
-        ...scope,
-        idempotencyKey,
-        resetType,
-      });
-      // /use 接受后按既有对账协议确认 used_at 变化（[0,250,750,1500]ms）。
-      const baseline =
-        resetType === "WEEK"
-          ? fresh.latestWeekResetHistory?.usedAt ?? null
-          : fresh.latestFiveHourResetHistory?.usedAt ?? null;
-      for (const delayMs of USE_CONFIRM_RETRY_DELAYS_MS) {
-        await sleep(delayMs);
-        const confirmed = await this.deps.usageStatsService.getCodingPlanResetStatus(scope);
-        const usedAt =
-          resetType === "WEEK"
-            ? confirmed.latestWeekResetHistory?.usedAt ?? null
-            : confirmed.latestFiveHourResetHistory?.usedAt ?? null;
-        if (usedAt !== null && usedAt !== baseline) {
-          serviceLogger.info("reset card auto-claimed", { resetType, usedAt });
-          this.useIdempotencyKey = null;
-          return;
+        // v2 派发门（quotaResumeGate）：核销前置 + 不盲放行，见 spec §9.3。
+        const admitted = await this.gate.admitClaimedIntent(intent, settings, scope);
+        if (admitted) {
+          void this.dispatchIntent(intent, settings);
         }
       }
-      serviceLogger.warn("reset card claim not confirmed, will retry with same key", {
-        resetType,
-      });
-    } catch (error) {
-      // 失败保留幂等 key（同一次核销重试复用），下一 tick 再试。
-      serviceLogger.warn("reset card auto-claim failed", {
-        resetType,
-        error: toErrorMessage(error),
-      });
-    } finally {
-      this.useInFlight = false;
-    }
-  }
-
-  private async requestOpportunity(scope: CodingPlanResetScopeRequest): Promise<void> {
-    const now = Date.now();
-    // 瞬时错误复用同一幂等 key；429/稳定错误换新 key（与 Coordinator 规则一致）。
-    const idempotencyKey = this.opportunityIdempotencyKey ?? randomUUID();
-    try {
-      const result = await this.deps.usageStatsService.requestCodingPlanResetOpportunity({
-        ...scope,
-        idempotencyKey,
-      });
-      this.opportunityIdempotencyKey = null;
-      this.opportunityCooldownUntil = nextOpportunityCooldownUntil(
-        result.granted,
-        result.nextTryAt,
-        now,
-      );
-      serviceLogger.info("opportunity judged", {
-        granted: result.granted,
-        nextTryAt: result.nextTryAt,
-      });
-    } catch (error) {
-      const transient = !isOpportunityThrottleError(error) && isOpportunityTransientError(error);
-      this.opportunityIdempotencyKey = transient ? idempotencyKey : null;
-      this.opportunityCooldownUntil =
-        now + (transient ? 5 * 60_000 : 10 * 60_000);
-      serviceLogger.warn("opportunity request failed", {
-        transient,
-        error: toErrorMessage(error),
-      });
     }
   }
 
@@ -533,8 +523,21 @@ export class QuotaWatchdogService {
             workspaceIdentity: intent.workspaceIdentity,
           })
         ) {
+          // 自发 compact 窗口内的活动是看门狗自己的 /compact 维护 turn：守卫重排，不取消意图。
+          if (now < (this.selfCompactUntil.get(intent.taskId) ?? 0)) {
+            await this.deps.resumeIntentRepo.reschedulePending(
+              intent.resumeIntentId,
+              now + RESUME_CONTEXT_COMPACT_DELAY_MS,
+              { now },
+            );
+            this.scheduleNextTick();
+            return;
+          }
           // 用户已自行活动（新消息/手动重试在跑）：取消自动意图，admission 先到者胜。
           await this.deps.resumeIntentRepo.cancel(intent.taskId, "user_activity_active", { now });
+          serviceLogger.info("resume intent cancelled, user activity", {
+            taskId: intent.taskId,
+          });
           return;
         }
         const rowTarget = this.failedRowTargets.get(intent.taskId) ?? null;
@@ -567,6 +570,8 @@ export class QuotaWatchdogService {
         });
         const outcomePromise = this.deps.dispatch.awaitTurnOutcome({
           sessionId: intent.taskId,
+          workspacePath: intent.workspacePath,
+          workspaceIdentity: intent.workspaceIdentity,
           timeoutMs: TURN_OUTCOME_TIMEOUT_MS,
         });
         const tracked = outcomePromise
@@ -574,13 +579,34 @@ export class QuotaWatchdogService {
             if (outcome.outcome === "completed") {
               await this.deps.resumeIntentRepo.deleteOnSuccess(intent.resumeIntentId);
               this.failedRowTargets.delete(intent.taskId);
+              this.contextCompactArmed.delete(intent.taskId);
+              this.selfCompactUntil.delete(intent.taskId);
               serviceLogger.info("auto-resume turn completed", { taskId: intent.taskId });
               return;
             }
-            await this.settleDispatchFailure(intent, outcome.errorMessage ?? "turn failed");
+            // 超时收口前核实任务是否仍在跑（长任务合法超 1h）：在跑则意图转取消（工作继续，
+            // 无需自动动作），不按失败回队——v1 这里会把仍运行的任务重复派发。
+            if (
+              outcome.errorMessage === "dispatch outcome timeout" &&
+              (await this.deps.dispatch.isTaskActive({
+                taskId: intent.taskId,
+                workspacePath: intent.workspacePath,
+                workspaceIdentity: intent.workspaceIdentity,
+              }))
+            ) {
+              await this.deps.resumeIntentRepo.cancel(intent.taskId, "task_still_running", {
+                now: Date.now(),
+              });
+              this.failedRowTargets.delete(intent.taskId);
+              serviceLogger.info("resume intent cancelled, task still running", {
+                taskId: intent.taskId,
+              });
+              return;
+            }
+            await this.settleDispatchFailure(intent, outcome);
           })
           .catch(async (error: unknown) => {
-            await this.settleDispatchFailure(intent, toErrorMessage(error));
+            await this.settleDispatchFailure(intent, { errorMessage: toErrorMessage(error) });
           })
           .finally(() => {
             this.pendingOutcomes.delete(intent.taskId);
@@ -592,44 +618,94 @@ export class QuotaWatchdogService {
           taskId: intent.taskId,
           error: toErrorMessage(error),
         });
-        await this.settleDispatchFailure(intent, toErrorMessage(error));
+        await this.settleDispatchFailure(intent, { errorMessage: toErrorMessage(error) });
       }
     })();
   }
 
-  private async settleDispatchFailure(intent: ResumeIntent, errorMessage: string): Promise<void> {
-    try {
-      const settings = await this.readSettings();
-      const nextAttempt = intent.attempt + 1;
-      if (intent.kind === "transient") {
-        const nextEligibleAt = nextTransientEligibleAt(nextAttempt, Date.now());
-        if (nextEligibleAt === null || nextAttempt >= settings.autoResumeMaxConsecutive) {
-          await this.deps.resumeIntentRepo.markExhausted(intent.resumeIntentId, errorMessage);
+  /**
+   * v2 结算：按派发 turn 的失败事实（code/attribution.reason）权威归类，替代 v1 仅按意图 kind。
+   * - plan_expired：终态 exhausted（无自动动作，绝不烧卡）。
+   * - context：未武装过 → 立即重排（派发门会先发 /compact）；已武装 → exhausted（压缩救不了）。
+   * - transient：1/5/15min 退避阶梯（1305 类限流按用户实测 ~1min 可续）。
+   * - quota：等重置或核销卡（派发门把关）；快照可读时按精确 nextReset 唤醒，替代固定 10min 兜底。
+   */
+  private async settleDispatchFailure(
+    intent: ResumeIntent,
+    failure: Omit<TurnOutcomeWaitResult, "outcome">,
+  ): Promise<void> {
+    await this.withTaskLock(intent.taskId, async () => {
+      try {
+        const settings = await this.readSettings();
+        const nextAttempt = intent.attempt + 1;
+        const message = failure.errorMessage ?? "turn failed";
+        const classified = classifyTurnFailure({
+          code: failure.errorCode ?? null,
+          message,
+          attributionReason: failure.attributionReason ?? null,
+          source: null,
+        });
+        if (classified === "plan_expired") {
+          await this.deps.resumeIntentRepo.markExhausted(
+            intent.resumeIntentId,
+            `${message} (plan expired; auto-resume stopped)`,
+          );
+          this.contextCompactArmed.delete(intent.taskId);
+          this.selfCompactUntil.delete(intent.taskId);
           return;
         }
+        if (classified === "context") {
+          if (this.contextCompactArmed.has(intent.taskId)) {
+            await this.deps.resumeIntentRepo.markExhausted(
+              intent.resumeIntentId,
+              `${message} (context overflow persists after auto-compact)`,
+            );
+          } else {
+            await this.deps.resumeIntentRepo.requeueAfterFailure(intent.resumeIntentId, {
+              kind: "context",
+              nextEligibleAt: Date.now() + RESUME_CONTEXT_COMPACT_DELAY_MS,
+              lastError: message,
+            });
+          }
+          return;
+        }
+        if (classified === "transient" || (classified === null && intent.kind === "transient")) {
+          const nextEligibleAt = nextTransientEligibleAt(nextAttempt, Date.now());
+          if (nextEligibleAt === null || nextAttempt >= settings.autoResumeMaxConsecutive) {
+            await this.deps.resumeIntentRepo.markExhausted(intent.resumeIntentId, message);
+            return;
+          }
+          await this.deps.resumeIntentRepo.requeueAfterFailure(intent.resumeIntentId, {
+            kind: "transient",
+            nextEligibleAt,
+            lastError: message,
+          });
+          return;
+        }
+        // quota（或无法归因的既有 quota 意图）：等重置/核销卡，派发门把关；可读快照时精确唤醒。
+        if (nextAttempt >= settings.autoResumeMaxConsecutive) {
+          await this.deps.resumeIntentRepo.markExhausted(intent.resumeIntentId, message);
+          return;
+        }
+        let base = Date.now() + QUOTA_FALLBACK_RETRY_MS;
+        try {
+          const fresh = await this.deps.usageStatsService.getEntitlementSnapshot();
+          base = fresh.remaining?.nextResetTime ?? base;
+        } catch {
+          // 快照不可用时退避兜底。
+        }
         await this.deps.resumeIntentRepo.requeueAfterFailure(intent.resumeIntentId, {
-          kind: intent.kind,
-          nextEligibleAt,
-          lastError: errorMessage,
+          kind: "quota",
+          nextEligibleAt: quotaEligibleAt(base, Date.now()),
+          lastError: message,
         });
-        return;
+      } catch (error) {
+        serviceLogger.warn("resume failure settle failed", {
+          taskId: intent.taskId,
+          error: toErrorMessage(error),
+        });
       }
-      // quota：重置时间未知时退避重试；触发上限同样生效。
-      if (nextAttempt >= settings.autoResumeMaxConsecutive) {
-        await this.deps.resumeIntentRepo.markExhausted(intent.resumeIntentId, errorMessage);
-        return;
-      }
-      await this.deps.resumeIntentRepo.requeueAfterFailure(intent.resumeIntentId, {
-        kind: "quota",
-        nextEligibleAt: Date.now() + QUOTA_FALLBACK_RETRY_MS + RESUME_QUOTA_WAKE_MARGIN_MS,
-        lastError: errorMessage,
-      });
-    } catch (error) {
-      serviceLogger.warn("resume failure settle failed", {
-        taskId: intent.taskId,
-        error: toErrorMessage(error),
-      });
-    }
+    });
   }
 
   private scheduleNextTick(): void {
@@ -640,8 +716,8 @@ export class QuotaWatchdogService {
     const wake = computeWakeDelayMs(this.status.wakeAt, now);
     if (wake !== null) delays.push(wake);
     // 主动状态下的机会冷却到期也要醒来。
-    if (this.status.state !== "idle" && this.opportunityCooldownUntil > now) {
-      delays.push(this.opportunityCooldownUntil - now);
+    if (this.status.state !== "idle" && this.claimBookkeeping.opportunityCooldownUntil > now) {
+      delays.push(this.claimBookkeeping.opportunityCooldownUntil - now);
     }
     if (this.pendingOutcomes.size === 0) {
       void (async () => {

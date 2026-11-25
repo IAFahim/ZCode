@@ -31,6 +31,12 @@ export interface AutoResumeFailureReport {
   nextResetTime: number | null;
   /** 失败 assistant 行目标（retryTurn 重放用）；无法定位时为 null，Host 走 sendText 回退。 */
   failedRowTarget?: { rowId: number; entityId: string } | null;
+  /**
+   * v2 修订：provider 业务码 / CLI 归因原因透传，Host 侧以此做权威归因
+   * （1309 到期禁烧卡、1261 溢出走 /compact、1305 限流短退避），覆盖上报方的 kind 粗分类。
+   */
+  providerErrorCode?: string | null;
+  attributionReason?: string | null;
 }
 
 /** 配额守护委托面（quotaWatchdogService 结构化实现；Host 侧组装时注入）。 */

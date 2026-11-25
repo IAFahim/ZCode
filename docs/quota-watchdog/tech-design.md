@@ -339,3 +339,25 @@ autoResumeMaxConsecutive: z.number().int().min(1).max(20).default(5),
    `pnpm architecture:context` 核对 services node 的装配面。
 4. **baseLogEpoch 的 stale ACK 回传字段命名**：`logEpochAtDecision` 待协议评审定名
    （§8.2）。
+
+## 13. v2 实施修订（2026-11-25）
+
+对应 spec §9。模块放置不变（§3）；差异：
+
+- **quotaWatchdogDomain**：新增 `remainingPercentFromEntitlement`（口径反转）、
+  `classifyTurnFailure`（code>reason>source>文本 优先级）、`claimTargetForFailure`
+  （仅 quota 类允许核销卡）、业务码集合（1309=plan_expired / 1261=context / 1305 等=transient）。
+- **quotaWatchdogService**：`admitClaimedIntent` 派发门（§9.3：核销前置 + 当轮派发 + 不盲放行）；
+  `settleDispatchFailure` 权威归类结算；`withTaskLock` 同 task 串行化；自发 compact 活动窗口；
+  结算 quota 路径按 live nextResetTime 精确唤醒。意图 kind 扩展 `context`
+  （`RESUME_CONTEXT_COMPACT_DELAY_MS=20s`；resume_intents.kind 为无约束 TEXT，无迁移）。
+- **QuotaResumeDispatchPort**：新增 `requestCompact`（v4 compact，非 CAS）；`awaitTurnOutcome`
+  改双通道（workspace 流订阅 + `onDynamicTaskTerminalOutcome`）并携带 code/attribution；
+  `isTaskActive` 维持 persist status `running` 语义。
+- **zcodeTaskServiceAdapter**：`onManualPromptSubmitted` 钩子（无后台归因的 sendPrompt 触发）；
+  node.ts 经 ref 后接线 `cancelAutoResume`（装配顺序：adapter 先于 watchdog 构造）。
+- **ResumeIntentRepo**：`upsertPending(incrementAttempt)`（renderer 上报不推进）；
+  `reschedulePending(kind)`（守卫重排可改写 kind）；无 schema 变更。
+- **已证伪假设**：v1 结局等待订阅 `onDynamicStreamEvent(sessionId)` 收不到事件（流按
+  workspace 路由），为"1 小时间隔循环"的直接根因；`remaining.percentage` 为已用占比，
+  为"watchdog 永远 idle"的直接根因。

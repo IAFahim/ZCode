@@ -2488,6 +2488,8 @@ exceptions:
       - packages/services/src/session/tasksDatabase/resume-intents-schema-v7.ts
       - packages/services/src/usage-stats/quotaWatchdogDomain.ts
       - packages/services/src/usage-stats/quotaWatchdogService.ts
+      - packages/services/src/usage-stats/quotaResumeClaim.ts
+      - packages/services/src/usage-stats/quotaResumeGate.ts
       - packages/ui/src/settings/AutoResumeSettingsCard.tsx
       - packages/ui/src/v4/useAutoResumeReport.ts
     reason: 配额守护与自动续跑（docs/quota-watchdog/spec.md + tech-design.md，spec-first）：纯领域状态机 / sqlite 仓库（复用 tasks-index.sqlite，migration 0007）/ Host 侧单例服务（运行态唯一所有者，经 IUsageStatsService 可选契约暴露）/ 渲染器上报 hook 与设置卡。与 offPeak 同构但未接管整个 legacy 目录；模块化收口留待单独的边界重构。
