@@ -6658,6 +6658,9 @@ const enUS: Record<string, string> = {
   "chat.contextUsageDescription":
     "Prompt text, tool calls, and responses all share this context window.",
   "chat.contextUsage.cacheHitRate": "Average cache hit rate",
+  "chat.contextUsage.autoCompact": "Auto-compact",
+  "chat.contextUsage.autoCompactAt": "Compact when context reaches",
+  "chat.contextUsage.autoCompactAtAuto": "Auto",
   "chat.contextUsage.breakdown": "Context sources",
   "chat.contextUsage.breakdown.messages": "Messages",
   "chat.contextUsage.breakdown.systemPrompt": "System prompt",
@@ -7866,8 +7869,7 @@ const enUS: Record<string, string> = {
   // Quota watchdog auto-resume (docs/quota-watchdog/spec.md)
   "chat.autoResume.armedQuota":
     "Task failed — it will resume automatically once the plan quota resets.",
-  "chat.autoResume.armedTransient":
-    "Task failed — it will retry automatically in a few minutes.",
+  "chat.autoResume.armedTransient": "Task failed — it will retry automatically in a few minutes.",
   "chat.quota.startPlan.bucketDailyLow":
     "{model} has {percent} of its daily quota remaining ({remaining} tokens).",
   "chat.quota.startPlan.bucketActivityLow":

@@ -203,6 +203,9 @@ interface SessionStartupPreferences {
   toolSearchMode: AppToolSearchMode;
   totalTokensReminderEnabled: boolean;
   agentAlwaysBackgroundEnabled: boolean;
+  /** 自动压缩开关与触发百分比（chat 面板设置）；旧 Host 缺席按开启 + 统一算法。 */
+  autoCompactEnabled: boolean;
+  autoCompactThresholdPercent: number;
   resolveInitialBashShellSelection: () => Promise<ExecutionShellSelection | undefined>;
 }
 
@@ -3711,6 +3714,8 @@ async function requestSessionRuntimePreferences(
         totalTokensReminderEnabled: false,
         // 旧 Host 不知道这个开关，按产品缺省开启。
         agentAlwaysBackgroundEnabled: true,
+        autoCompactEnabled: true,
+        autoCompactThresholdPercent: 100,
       };
     }
     throw error;
@@ -3736,6 +3741,9 @@ async function resolveSessionStartupPreferences(
       toolSearchMode: source.parent.toolSearchMode,
       totalTokensReminderEnabled: source.parent.totalTokensReminderEnabled,
       agentAlwaysBackgroundEnabled: source.parent.agentAlwaysBackgroundEnabled,
+      // record 未持久化自动压缩偏好；分支会话按缺省（开启 + 统一算法）。
+      autoCompactEnabled: true,
+      autoCompactThresholdPercent: 100,
       resolveInitialBashShellSelection: async () => inheritedShellSelection,
     };
   }
@@ -3762,6 +3770,8 @@ async function resolveSessionStartupPreferences(
     toolSearchMode: runtimePreferences.toolSearchMode,
     totalTokensReminderEnabled: runtimePreferences.totalTokensReminderEnabled,
     agentAlwaysBackgroundEnabled: runtimePreferences.agentAlwaysBackgroundEnabled,
+    autoCompactEnabled: runtimePreferences.autoCompactEnabled !== false,
+    autoCompactThresholdPercent: runtimePreferences.autoCompactThresholdPercent ?? 100,
     resolveInitialBashShellSelection: async () => {
       const executionPreferences = await requestSessionRuntimePreferences(
         context,
@@ -3892,6 +3902,15 @@ async function createRecord(
       // Memory Settings 是现有 CLI features.memory/use 之外的总开关。只在关闭时
       // 写入 override，避免开启值反向覆盖用户已有的 CLI 禁用配置。
       ...(startupPreferences.memoryEnabled ? {} : { memory: { enabled: false } }),
+      // 自动压缩（chat 输入区 context 面板设置）：threshold < 100 时写入 usagePercentTrigger
+      //（policy.ts 按有效窗口比例取阈值）；100 保持统一算法，行为与未设置完全一致。
+      compact: {
+        enabled: startupPreferences.autoCompactEnabled,
+        ...(startupPreferences.autoCompactEnabled &&
+        startupPreferences.autoCompactThresholdPercent < 100
+          ? { usagePercentTrigger: startupPreferences.autoCompactThresholdPercent }
+          : {}),
+      },
       // desktop-continuous session/create 由 UI 先解析 ~/.zcode/.agents 的 enabled MCP，
       // 但 protocol app-server 自己不会读取 UI/main 侧的 MCP store；之前 createRecord 没把
       // params.mcpServers 注入 runtimeConfig，导致日志里 runtimeHasMcpConfig=false，工具永远不启动。

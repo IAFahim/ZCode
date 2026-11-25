@@ -20,7 +20,14 @@ export interface AutoCompactPolicyConfig {
   modelContextBudgetStrategy?: "legacy" | "preflight-v1";
   summaryReserveTokens?: number;
   bufferTokens?: number;
+  /** 旧字段：已刻意停用（见 compact-policy.test.ts「旧 percent override 不再改变统一算法」），勿复用。 */
   thresholdPercentOverride?: number;
+  /**
+   * 用户可调压缩触发点（context bar 的百分比，1–100）。设置后阈值 =
+   * floor(有效窗口 × pct / 100)（有效窗口已扣输出预留，因此压缩仍有摘要/输出余量）。
+   * 未设置时保持统一算法（effective − buffer）。100 等价于"尽量晚"。
+   */
+  usagePercentTrigger?: number;
   maxConsecutiveFailures?: number;
   microcompact?: LocalMicrocompactPolicyConfig;
 }
@@ -88,6 +95,23 @@ export function getAutoCompactOutputReserveTokens(config: AutoCompactPolicyConfi
 
 export function getAutoCompactThreshold(config: AutoCompactPolicyConfig = {}): number {
   const effectiveContextWindow = getEffectiveContextWindowSize(config);
+  // 用户显式设置了触发百分比：按有效窗口（已扣输出预留）比例取阈值，
+  // 保证压缩摘要与模型输出仍有余量；buffer 不再叠加（避免小百分比被吃掉）。
+  const triggerPercent = config.usagePercentTrigger;
+  if (
+    typeof triggerPercent === "number" &&
+    Number.isFinite(triggerPercent) &&
+    triggerPercent > 0 &&
+    triggerPercent < 100
+  ) {
+    return Math.max(
+      0,
+      Math.min(
+        effectiveContextWindow - (positiveInt(config.bufferTokens) ?? AUTOCOMPACT_BUFFER_TOKENS),
+        Math.floor((effectiveContextWindow * triggerPercent) / 100),
+      ),
+    );
+  }
   const buffer = positiveInt(config.bufferTokens) ?? AUTOCOMPACT_BUFFER_TOKENS;
   return Math.max(0, effectiveContextWindow - buffer);
 }

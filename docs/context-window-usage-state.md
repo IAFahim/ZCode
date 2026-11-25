@@ -65,3 +65,18 @@ provider registry(contextWindow changed)
 ```
 
 这是同一模型的能力元数据热更新，不产生模型切换 marker，也不重算已使用 token。
+
+## 自动压缩设置（2026-11-25 增补）
+
+chat 输入区 context 面板新增「自动压缩」开关与触发点选择（`autoCompactEnabled` /
+`autoCompactThresholdPercent`，AppSettings）：
+
+- 走 session runtime preferences 通道（与 memoryEnabled / toolSearchMode 同链路）：
+  Host `resolveSessionRuntimePreferences` → CLI `resolveSessionStartupPreferences` →
+  `createRecord` 写入 `runtimeConfig.compact`。**新建或冷恢复 Session 时读取；已有
+  Runtime 保持原策略**（与 protocol.ts 声明一致）。
+- `enabled=false` 关闭 auto compact 与 microcompact（policy.ts `enabled === false` 分支）。
+- threshold < 100 写入 `compact.usagePercentTrigger`：阈值 = floor(有效窗口 × pct/100)，
+  并钳制在统一算法阈值（effective − buffer）以内——任何设置都不会比默认压缩得更晚。
+  100（默认「自动」）不写入该字段，行为与历史版本逐位一致。
+- 旧的 `thresholdPercentOverride` 保持刻意停用（compact-policy.test.ts 锁定），勿复用。

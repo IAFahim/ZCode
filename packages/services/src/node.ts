@@ -2705,6 +2705,9 @@ export function createLocalServices(options: {
               totalTokensReminderEnabled: settings.totalTokensReminderEnabled === true,
               agentAlwaysBackgroundEnabled: settings.agentAlwaysBackgroundEnabled !== false,
               memoryEnabled: settings.memoryEnabled === true,
+              // 自动压缩（chat 输入区 context 面板可改）：新建/冷恢复 runtime 时生效。
+              autoCompactEnabled: settings.autoCompactEnabled !== false,
+              autoCompactThresholdPercent: settings.autoCompactThresholdPercent ?? 100,
               modelContextBudgetStrategy,
               // user-execution 只消费 Shell；共享默认策略是统一 result schema 的兼容占位，
               // 不会覆盖 runtime-materialization 阶段已经固定的 strategy。

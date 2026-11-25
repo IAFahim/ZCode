@@ -2216,6 +2216,9 @@ export const zcodeSessionRuntimePreferencesResultSchema = z
     // 旧 Host 缺席即不注册 App 控制工具；只由 Host 装配能力声明。
     appControlEnabled: z.boolean().optional(),
     memoryEnabled: z.boolean().default(false),
+    // 自动压缩：旧 Host 缺席即开启 + 统一算法（尽量晚）；CLI 只在创建或冷恢复 runtime 时读取。
+    autoCompactEnabled: z.boolean().default(true),
+    autoCompactThresholdPercent: z.number().int().min(50).max(100).default(100),
     askUserQuestionAutoResolutionEnabled: z.boolean().default(true),
     integratedTerminalShell: integratedTerminalShellSelectionSchema.optional(),
     // 兼容旧 Host：缺少字段时在协议解析边界使用当前默认策略。

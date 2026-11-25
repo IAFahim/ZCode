@@ -374,6 +374,14 @@ export interface AppSettings {
   agentAlwaysBackgroundEnabled?: boolean;
   /** 新建或冷恢复 Session 是否启用 Memory；默认关闭。 */
   memoryEnabled?: boolean;
+  // 自动压缩（docs/context-window-usage-state.md；新建或冷恢复 Session 时读取，已有 Runtime 保持原策略）。
+  /** 上下文接近窗口上限时是否自动压缩并继续；默认开启。 */
+  autoCompactEnabled?: boolean;
+  /**
+   * 自动压缩触发点（context bar 百分比 50–100）；100 = 自动（统一算法，尽量晚）。
+   * 新建或冷恢复时读取，已有 Runtime 保持原策略。
+   */
+  autoCompactThresholdPercent?: number;
   // 配额守护与自动续跑（docs/quota-watchdog/spec.md §3.5）；缺省按 schema 默认值兼容。
   /** 任务失败后是否自动等待额度重置/按阶梯重试并续跑；默认开启。 */
   autoResumeEnabled?: boolean;

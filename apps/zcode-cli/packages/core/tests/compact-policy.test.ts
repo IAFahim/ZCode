@@ -197,6 +197,56 @@ describe("auto compact policy", () => {
     });
   });
 
+  it("usagePercentTrigger：阈值按有效窗口比例取值，钳制在统一算法阈值以内", () => {
+    // 200k 窗口：比例 reserve = max(21k, 8%×200k=16k) = 21k → 有效 179k；75% = 134,250。
+    expect(
+      getAutoCompactThreshold({
+        contextWindow: 200_000,
+        maxOutputTokens: 32_000,
+        usagePercentTrigger: 75,
+      }),
+    ).toBe(134_250);
+    // 高百分比被统一算法阈值（effective − buffer = 166k）钳制，绝不晚于默认压缩。
+    expect(
+      getAutoCompactThreshold({
+        contextWindow: 200_000,
+        maxOutputTokens: 32_000,
+        usagePercentTrigger: 95,
+      }),
+    ).toBe(166_000);
+    // 100 视为未设置（走统一算法），非法值同样忽略。
+    expect(
+      getAutoCompactThreshold({
+        contextWindow: 200_000,
+        maxOutputTokens: 32_000,
+        usagePercentTrigger: 100,
+      }),
+    ).toBe(166_000);
+    expect(
+      getAutoCompactThreshold({
+        contextWindow: 200_000,
+        maxOutputTokens: 32_000,
+        usagePercentTrigger: Number.NaN,
+      }),
+    ).toBe(166_000);
+    // shouldAutoCompact 尊重该阈值。50% = floor(179k×0.5) = 89,500。
+    const config = { contextWindow: 200_000, maxOutputTokens: 32_000, usagePercentTrigger: 50 };
+    expect(
+      shouldAutoCompact({
+        config,
+        messages: ENOUGH_MESSAGES,
+        tokenOverride: { source: "provider_usage", tokenCount: 89_499 },
+      }),
+    ).toMatchObject({ reason: "below_threshold", threshold: 89_500 });
+    expect(
+      shouldAutoCompact({
+        config,
+        messages: ENOUGH_MESSAGES,
+        tokenOverride: { source: "provider_usage", tokenCount: 89_500 },
+      }),
+    ).toMatchObject({ reason: "above_threshold", shouldCompact: true, threshold: 89_500 });
+  });
+
   it("旧 percent override 不再改变统一算法", () => {
     expect(
       getAutoCompactThreshold({

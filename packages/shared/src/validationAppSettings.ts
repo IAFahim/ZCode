@@ -589,6 +589,9 @@ const appSettingsObjectSchema = z.object({
   onboardingOccupation: appSettingsOccupationSchema.nullish(),
   proactiveSuggestionsEnabled: z.boolean().optional(),
   memoryEnabled: z.boolean().default(false),
+  // 自动压缩（新建或冷恢复 Session 时读取，见 protocol.ts 注释）；默认开启 + 100（统一算法）。
+  autoCompactEnabled: z.boolean().default(true),
+  autoCompactThresholdPercent: z.number().int().min(50).max(100).default(100),
   // 配额守护与自动续跑（docs/quota-watchdog/spec.md §3.5）：全部 opt-out，全关 = 零行为变化。
   autoResumeEnabled: z.boolean().default(true),
   autoClaimResetCardsEnabled: z.boolean().default(true),
@@ -714,6 +717,8 @@ export const appSettingsPatchSchema = z.object({
     .nullish(),
   proactiveSuggestionsEnabled: z.boolean().optional(),
   memoryEnabled: z.boolean().optional(),
+  autoCompactEnabled: z.boolean().optional(),
+  autoCompactThresholdPercent: z.number().int().min(50).max(100).optional(),
   autoResumeEnabled: z.boolean().optional(),
   autoClaimResetCardsEnabled: z.boolean().optional(),
   quotaWatchThresholdPercent: z.number().int().min(1).max(50).optional(),
