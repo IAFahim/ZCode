@@ -24,8 +24,9 @@ export interface AutoCompactPolicyConfig {
   thresholdPercentOverride?: number;
   /**
    * 用户可调压缩触发点（context bar 的百分比，1–100）。设置后阈值 =
-   * floor(有效窗口 × pct / 100)（有效窗口已扣输出预留，因此压缩仍有摘要/输出余量）。
-   * 未设置时保持统一算法（effective − buffer）。100 等价于"尽量晚"。
+   * min(floor(完整上下文窗口 × pct / 100), 统一算法阈值)：
+   * 分母与 context bar 一致（窗口的一半就是 50% 处），上限保证不会晚于默认算法。
+   * 未设置（或 100）时保持统一算法（effective − buffer）。
    */
   usagePercentTrigger?: number;
   maxConsecutiveFailures?: number;
@@ -94,9 +95,11 @@ export function getAutoCompactOutputReserveTokens(config: AutoCompactPolicyConfi
 }
 
 export function getAutoCompactThreshold(config: AutoCompactPolicyConfig = {}): number {
+  const contextWindow = positiveInt(config.contextWindow) ?? DEFAULT_COMPACT_CONTEXT_WINDOW;
   const effectiveContextWindow = getEffectiveContextWindowSize(config);
-  // 用户显式设置了触发百分比：按有效窗口（已扣输出预留）比例取阈值，
-  // 保证压缩摘要与模型输出仍有余量；buffer 不再叠加（避免小百分比被吃掉）。
+  const buffer = positiveInt(config.bufferTokens) ?? AUTOCOMPACT_BUFFER_TOKENS;
+  // 统一算法的最晚触发点：有效窗口（已扣输出预留）再留 buffer，压缩摘要与模型输出都有余量。
+  const latest = Math.max(0, effectiveContextWindow - buffer);
   const triggerPercent = config.usagePercentTrigger;
   if (
     typeof triggerPercent === "number" &&
@@ -104,16 +107,12 @@ export function getAutoCompactThreshold(config: AutoCompactPolicyConfig = {}): n
     triggerPercent > 0 &&
     triggerPercent < 100
   ) {
-    return Math.max(
-      0,
-      Math.min(
-        effectiveContextWindow - (positiveInt(config.bufferTokens) ?? AUTOCOMPACT_BUFFER_TOKENS),
-        Math.floor((effectiveContextWindow * triggerPercent) / 100),
-      ),
-    );
+    // Bugfix：百分比曾以"有效窗口"为分母（1M 窗口下 50% 实际在 46 万处触发），与 context bar
+    // 显示的 335.6K/1M 口径不一致——用户选 50% 就是期望在一半窗口处压缩。改为按完整窗口取值，
+    // 并以统一算法阈值为上限。
+    return Math.max(0, Math.min(latest, Math.floor((contextWindow * triggerPercent) / 100)));
   }
-  const buffer = positiveInt(config.bufferTokens) ?? AUTOCOMPACT_BUFFER_TOKENS;
-  return Math.max(0, effectiveContextWindow - buffer);
+  return latest;
 }
 
 export function shouldAutoCompact(input: {

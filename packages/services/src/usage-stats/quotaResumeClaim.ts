@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
-import type { CodingPlanResetScopeRequest, CodingPlanResetStatusSnapshot } from "@zcode/shared";
+import type {
+  CodingPlanResetScopeRequest,
+  CodingPlanResetStatusSnapshot,
+  CodingPlanResetType,
+} from "@zcode/shared";
 import { createServiceLogger } from "#src/logger/serviceLogger.js";
 import {
+  hasUsableResetCard,
   isOpportunityTransientError,
   isOpportunityThrottleError,
   nextOpportunityCooldownUntil,
@@ -54,6 +59,7 @@ export function createEmptyClaimBookkeeping(): QuotaResumeClaimBookkeeping {
 export function createQuotaResumeClaim(
   usageStatsService: IUsageStatsService,
   bookkeeping: QuotaResumeClaimBookkeeping,
+  clock: () => number = () => Date.now(),
 ) {
   /**
    * 核销当前可用的重置卡。返回对账确认是否成功（false = 未确认，宿主短重试，
@@ -62,13 +68,17 @@ export function createQuotaResumeClaim(
   async function claimResets(
     resetSnapshot: CodingPlanResetStatusSnapshot,
     scope: CodingPlanResetScopeRequest,
+    requestedType?: CodingPlanResetType,
   ): Promise<boolean> {
-    const now = Date.now();
-    const resetType = resolveClaimTarget(resetSnapshot, now);
+    const now = clock();
+    // 卡型由调用方按 provider 业务码裁决（1310 周/月上限只有 WEEK 卡有效）；
+    // 未指定时沿用"5 小时卡优先"的最小代价原则。
+    const resetType = requestedType ?? resolveClaimTarget(resetSnapshot, now);
     if (!resetType) {
       return false;
     }
-    // 对账后无可核销机会即放弃，不携带新幂等键重试（与 renderer 强制对账同语义）。
+    // 对账后所请求的卡型已不可用即放弃，不携带新幂等键重试，也不退到另一卡型
+    //（换卡型等于推翻调用方按业务码做过的裁决）。
     let fresh: CodingPlanResetStatusSnapshot;
     try {
       fresh = await usageStatsService.getCodingPlanResetStatus(scope);
@@ -76,8 +86,7 @@ export function createQuotaResumeClaim(
       serviceLogger.warn("pre-use reconciliation failed", { error: toErrorMessage(error) });
       return false;
     }
-    const stillClaimable = resolveClaimTarget(fresh, Date.now());
-    if (stillClaimable !== resetType) {
+    if (!hasUsableResetCard(fresh, resetType, clock())) {
       return false;
     }
     const idempotencyKey = bookkeeping.useIdempotencyKey ?? randomUUID();
@@ -123,9 +132,13 @@ export function createQuotaResumeClaim(
     }
   }
 
-  /** 主动状态无卡时补位触发服务端资格判断（renderer hidden 时无人触发，spec §3.2）。 */
-  async function requestOpportunity(scope: CodingPlanResetScopeRequest): Promise<void> {
-    const now = Date.now();
+  /**
+   * 主动状态无卡时补位触发服务端资格判断（renderer hidden 时无人触发，spec §3.2）。
+   * 返回服务端是否本次发卡。
+   */
+  async function requestOpportunity(scope: CodingPlanResetScopeRequest): Promise<boolean> {
+    const now = clock();
+    let granted = false;
     // 瞬时错误复用同一幂等 key；429/稳定错误换新 key（与 Coordinator 规则一致）。
     const idempotencyKey = bookkeeping.opportunityIdempotencyKey ?? randomUUID();
     try {
@@ -134,6 +147,7 @@ export function createQuotaResumeClaim(
         idempotencyKey,
       });
       bookkeeping.opportunityIdempotencyKey = null;
+      granted = result.granted;
       bookkeeping.opportunityCooldownUntil = nextOpportunityCooldownUntil(
         result.granted,
         result.nextTryAt,
@@ -152,9 +166,15 @@ export function createQuotaResumeClaim(
         error: toErrorMessage(error),
       });
     }
+    return granted;
   }
 
-  return { claimResets, requestOpportunity };
+  /** 是否可以发起核销（/use 对账进行中时绝不并发发第二次）。 */
+  function canRequest(): boolean {
+    return !bookkeeping.useInFlight;
+  }
+
+  return { claimResets, requestOpportunity, canRequest };
 }
 
 export type QuotaResumeClaim = ReturnType<typeof createQuotaResumeClaim>;

@@ -62,6 +62,14 @@ function rowToIntent(row: ResumeIntentRow): ResumeIntent {
   };
 }
 
+/**
+ * attempt 推进方式。
+ * - increment：该失败对应一次真实派发（默认，v1 语义）。
+ * - keep：等待型失败（额度未恢复的快速失败 / 守卫重排 / 派发本身失败），不算一次尝试。
+ * - reset：续跑已产出真实进展后才再次耗尽，属于新的耗尽周期，连续计数清零。
+ */
+export type ResumeAttemptMode = "increment" | "keep" | "reset";
+
 export interface ResumeIntentUpsertParams {
   taskId: string;
   workspacePath: string;
@@ -155,6 +163,19 @@ export class ResumeIntentRepo {
     return row ?? null;
   }
 
+  /** 该 task 的活跃意图（pending 或 dispatched）；每 task 至多一条（见 upsertPending 的收敄规则）。 */
+  private getActiveRowByTask(taskId: string): ResumeIntentRow | null {
+    const row = this.getDatabase()
+      .prepare(
+        `SELECT * FROM resume_intents
+         WHERE task_id = ? AND status IN ('pending','dispatched')
+         ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1`,
+      )
+      .get(taskId) as ResumeIntentRow | undefined;
+    return row ?? null;
+  }
+
+  /** 该 task 当前是否只有 pending 行（无 dispatched）。 */
   private getPendingByTask(taskId: string): ResumeIntentRow | null {
     const row = this.getDatabase()
       .prepare(`SELECT * FROM resume_intents WHERE task_id = ? AND status = 'pending' LIMIT 1`)
@@ -162,45 +183,57 @@ export class ResumeIntentRepo {
     return row ?? null;
   }
 
+  /** 该 task 的活跃意图（pending 或 dispatched）；没有返回 null。 */
+  async getActiveByTask(taskId: string): Promise<ResumeIntent | null> {
+    await this.ensureReady();
+    const row = this.getActiveRowByTask(taskId);
+    return row ? rowToIntent(row) : null;
+  }
+
   // ---- 写入 ----
 
   /**
-   * 建 pending 意图；同 task 已有 pending 时**更新**既有行
-   * （attempt 仅在 incrementAttempt 时 +1：v2 修订——renderer 失败上报与派发结局结算
-   * 描述的是同一次失败，双路径各自 +1 会把连续计数翻倍并提前耗尽上限；
-   * 默认 incrementAttempt=true 保留既有语义），不叠加第二行。返回生效后的意图。
+   * 建/更新 pending 意图，**每 task 始终只有一条活跃行**：
+   * - 无活跃行 → 插入（attempt 0）。
+   * - 已有 pending 行 → 原地更新（kind / nextEligibleAt / lastError，attempt 按 attemptMode）。
+   * - 已有 dispatched 行 → 把它收敄回 pending（该失败即这次派发的结局）。
+   * v1/v2 在 dispatched 行存在时另插一条新 pending：随后结局结算把 dispatched 行改回
+   * pending 即撞 idx_resume_pending（UNIQUE constraint failed），旧行永远卡在 dispatched、
+   * 新行 attempt 恒为 0——连续上限因此从不生效。收敄到同一行是这两个问题的共同修复。
    */
   async upsertPending(
     params: ResumeIntentUpsertParams,
-    options?: { now?: number; incrementAttempt?: boolean },
+    options?: { now?: number; attemptMode?: ResumeAttemptMode },
   ): Promise<ResumeIntent> {
     await this.ensureReady();
     const db = this.getDatabase();
     const now = options?.now ?? Date.now();
-    const attemptDelta = options?.incrementAttempt === false ? 0 : 1;
+    const attemptMode = options?.attemptMode ?? "increment";
     const workspaceKey = resolveWorkspaceKey({
       workspacePath: params.workspacePath,
       workspaceIdentity: params.workspaceIdentity,
     });
     db.exec("BEGIN IMMEDIATE");
     try {
-      const existing = this.getPendingByTask(params.taskId);
+      const existing = this.getActiveRowByTask(params.taskId);
       if (existing) {
         db.prepare(
           `UPDATE resume_intents
-          SET kind = @kind,
-              attempt = attempt + @attempt_delta,
+          SET status = 'pending',
+              kind = @kind,
+              attempt = MAX(0, attempt + @attempt_delta),
               next_eligible_at = @next_eligible_at,
               workspace_path = @workspace_path,
               workspace_key = @workspace_key,
               workspace_identity = @workspace_identity,
               last_error = @last_error,
               updated_at = @now
-          WHERE resume_intent_id = @id AND status = 'pending'`,
+          WHERE resume_intent_id = @id AND status IN ('pending','dispatched')`,
         ).run({
           id: existing.resume_intent_id,
           kind: params.kind,
-          attempt_delta: attemptDelta,
+          attempt_delta:
+            attemptMode === "reset" ? -existing.attempt : attemptMode === "keep" ? 0 : 1,
           next_eligible_at: params.nextEligibleAt,
           workspace_path: params.workspacePath,
           workspace_key: workspaceKey,
@@ -213,6 +246,12 @@ export class ResumeIntentRepo {
         return rowToIntent(row);
       }
       const resumeIntentId = `resume-${randomUUID()}`;
+      // 新一轮失败开始：清掉该 task 上一轮的终态行（exhausted/cancelled），
+      // 避免每个耗尽周期都残留一行、也避免旧终态行被 getEffectiveByTask 误读为当前状态。
+      db.prepare(
+        `DELETE FROM resume_intents
+         WHERE task_id = @task_id AND status IN ('exhausted','cancelled')`,
+      ).run({ task_id: params.taskId });
       db.prepare(
         `INSERT INTO resume_intents (
           resume_intent_id, task_id, workspace_path, workspace_key, workspace_identity,
@@ -297,16 +336,17 @@ export class ResumeIntentRepo {
   async requeueAfterFailure(
     resumeIntentId: string,
     next: { kind: ResumeIntentKind; nextEligibleAt: number; lastError?: string },
-    options?: { now?: number },
+    options?: { now?: number; attemptMode?: ResumeAttemptMode },
   ): Promise<ResumeIntent | null> {
     await this.ensureReady();
     const now = options?.now ?? Date.now();
+    const attemptMode = options?.attemptMode ?? "increment";
     const res = this.getDatabase()
       .prepare(
         `UPDATE resume_intents
         SET status = 'pending',
             kind = @kind,
-            attempt = attempt + 1,
+            attempt = MAX(0, attempt + @attempt_delta),
             next_eligible_at = @next_eligible_at,
             last_error = @last_error,
             updated_at = @now
@@ -317,6 +357,13 @@ export class ResumeIntentRepo {
         kind: next.kind,
         next_eligible_at: next.nextEligibleAt,
         last_error: next.lastError ?? null,
+        // reset = 先回到 0（SELECT 与 UPDATE 同一同步连接、单线程，无并发窗口）。
+        attempt_delta:
+          attemptMode === "reset"
+            ? -(this.getRow(resumeIntentId)?.attempt ?? 0)
+            : attemptMode === "keep"
+              ? 0
+              : 1,
         now,
       });
     if (res.changes !== 1) return null;
@@ -419,17 +466,61 @@ export class ResumeIntentRepo {
   /**
    * 启动恢复（Host 启动时调用一次）：崩溃实例残留的 dispatched 行回到 pending
    * （attempt/nextEligibleAt 保留，nextEligibleAt 已过则本轮 tick 自然认领）。
+   * olderThanMs 缺省按 RESUME_DISPATCH_STALE_MS；宿主进程刚启动时没有任何在途派发
+   * 可能存活，调用方传 0 回收全部 dispatched 行（v2 只回收 15 分钟前的行，
+   * 崩溃前 15 分钟内派发的意图因此永远卡在 dispatched）。
    */
-  async recoverStaleDispatched(now: number): Promise<number> {
+  async recoverStaleDispatched(now: number, options?: { olderThanMs?: number }): Promise<number> {
     await this.ensureReady();
+    const db = this.getDatabase();
+    const stale = now - Math.max(0, options?.olderThanMs ?? RESUME_DISPATCH_STALE_MS);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      // 同 task 已另有 pending 行的残留 dispatched 行直接删除：把它们改回 pending 会撞
+      // idx_resume_pending（v1/v2 启动恢复在此抛 UNIQUE，导致恢复整体失效）。
+      db.prepare(
+        `DELETE FROM resume_intents
+         WHERE status = 'dispatched'
+           AND updated_at <= @stale
+           AND EXISTS (
+             SELECT 1 FROM resume_intents p
+             WHERE p.task_id = resume_intents.task_id AND p.status = 'pending'
+           )`,
+      ).run({ stale });
+      const res = db
+        .prepare(
+          `UPDATE resume_intents
+          SET status = 'pending', updated_at = @now
+          WHERE status = 'dispatched'
+            AND updated_at <= @stale`,
+        )
+        .run({ now, stale });
+      db.exec("COMMIT");
+      return Number(res.changes ?? 0);
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * 把某类 pending 意图的到期时刻提前到不晚于 nextEligibleAt（重置卡核销成功后：
+   * 所有等待额度的任务都应立即续跑，而不是继续等各自的 nextResetTime）。只提前不推迟。
+   */
+  async bringPendingForward(
+    kind: ResumeIntentKind,
+    nextEligibleAt: number,
+    options?: { now?: number },
+  ): Promise<number> {
+    await this.ensureReady();
+    const now = options?.now ?? Date.now();
     const res = this.getDatabase()
       .prepare(
         `UPDATE resume_intents
-        SET status = 'pending', updated_at = @now
-        WHERE status = 'dispatched'
-          AND updated_at <= @stale`,
+        SET next_eligible_at = @at, updated_at = @now
+        WHERE status = 'pending' AND kind = @kind AND next_eligible_at > @at`,
       )
-      .run({ now, stale: now - RESUME_DISPATCH_STALE_MS });
+      .run({ at: nextEligibleAt, kind, now });
     return Number(res.changes ?? 0);
   }
 

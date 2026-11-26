@@ -2490,9 +2490,13 @@ exceptions:
       - packages/services/src/usage-stats/quotaWatchdogService.ts
       - packages/services/src/usage-stats/quotaResumeClaim.ts
       - packages/services/src/usage-stats/quotaResumeGate.ts
+      - packages/services/src/usage-stats/quotaResumeTracker.ts
+      - packages/services/src/usage-stats/quotaResumeSettlement.ts
+      - packages/services/src/session/autoCompactPolicySync.ts
+      - apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/auto-compact-policy.ts
       - packages/ui/src/settings/AutoResumeSettingsCard.tsx
       - packages/ui/src/v4/useAutoResumeReport.ts
-    reason: 配额守护与自动续跑（docs/quota-watchdog/spec.md + tech-design.md，spec-first）：纯领域状态机 / sqlite 仓库（复用 tasks-index.sqlite，migration 0007）/ Host 侧单例服务（运行态唯一所有者，经 IUsageStatsService 可选契约暴露）/ 渲染器上报 hook 与设置卡。与 offPeak 同构但未接管整个 legacy 目录；模块化收口留待单独的边界重构。
+    reason: 配额守护与自动续跑（docs/quota-watchdog/spec.md + tech-design.md，spec-first）：纯领域状态机 / sqlite 仓库（复用 tasks-index.sqlite，migration 0007）/ Host 侧单例服务（运行态唯一所有者，经 IUsageStatsService 可选契约暴露）/ 渲染器上报 hook 与设置卡。v3 把服务按职责拆成 quotaWatchdogService（额度观测 + 状态机 + tick 循环）、quotaResumeTracker（每任务派发与结局结算）、quotaResumeSettlement（结算纯函数）与 quotaResumeGate（派发前裁定），均低于 800 行上限。autoCompactPolicySync（Host）与 bootstrap v4 原生层的 auto-compact-policy（无依赖叶子映射）属同一用户设置——自动压缩开关 / 阈值的即时下发（docs/context-window-usage-state.md），与会话物化共用一份映射。与 offPeak 同构但未接管整个 legacy 目录；模块化收口留待单独的边界重构。
   - id: ui-more-locales-new-files
     rule: unmanaged-new-file
     paths:

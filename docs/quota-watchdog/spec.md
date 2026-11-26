@@ -356,3 +356,120 @@ quota 意图派发前必须过 live 快照证实：
 - 1309 失败：无自动动作；意图不创建。
 - 1261 失败：/compact 发出 → 续跑一次 → 若再失败即 exhausted。
 - 用户在意图 pending 期间手动发送消息：意图被取消，不再自动派发。
+
+## 10. v3 修订（2026-11-26：宿主统一接纳失败、"不可知"不等于"耗尽"、结局可靠收口）
+
+v2 上线后的线上证据（本机 `tasks-index.sqlite` 的 `resume_intents`）：3 条 quota 意图自 11-25 19:03 起
+每 5 分钟被守卫重排一次，卡死 7–24 小时；checkpoint 的 `lastGoodRemainingPercent` 始终为 `null`
+（看门狗从未读到可读额度）；同一 task 留下 6 条永远停在 `dispatched` 的行。本节为权威修订，
+§3 / §9 中与本节冲突处以本节为准。
+
+### 10.1 失败事实：宿主统一接纳（取代"可见 pane 上报"）
+
+- **权威通道是宿主 task index 同步器**：会话 `phase` 由非终态迁入 `error`（live 迁移，冷恢复的水合
+  不算）时，把 `projection.lastError` 的 code / message / attribution 交给
+  `handleSessionFailure({ via: "detector" })`。后台任务与非当前 pane 的会话同样被接纳；辅助会话
+  （子代理等）不接纳。
+- renderer `useAutoResumeReport` 降级为**冗余通道**（`via: "report"`），必须携带失败发生时刻
+  `errorAt`；超过 60s（`RESUME_REPORT_FRESH_WINDOW_MS`）的报告视为 SessionPane 重新挂载后的
+  陈旧重放并丢弃（v2 因此复活已取消 / 已耗尽的意图）。
+- 看门狗自己派发的续跑 turn 的结局（`via: "outcome"`）**按输入过滤**：终态带的 `inputId` 不是本轮
+  （`resume-<intentId>-<now>`）即忽略。当前 task index 只对经 `sendPrompt` 的输入记录 `inputId`，
+  看门狗直发 v4 命令的终态不带 `inputId`，按"派发后第一个终态即本轮"处理；用户手动发送消息会
+  先取消意图并释放在途记录，其终态不会被当成本轮结局。
+- **线上顺序是终态先到、归因后到**：task index 先发 turn 终态（结局通道只知道"这一轮失败了"），
+  随后回源快照的 detector 才带回权威 `lastError`。不带归因的失败结局因此**不立即结算**，
+  而是保留在途记录最多 10 秒，把结算让给 detector；宽限内 detector 没来才按"无法归因"结算
+  （绝不因此卡在 `dispatched`）。否则额度类快速失败会错记 attempt、走错退避阶梯，续跑长时间
+  正常运转后才耗尽也会累计到上限提前停止。
+- 三条通道汇入 `QuotaResumeTracker.handleSessionFailure` 同一入口：同 task 串行（`withTaskLock`），
+  **去重与结算在同一把锁内判定**（同签名失败 5s 内只结算一次，`RESUME_FAILURE_DEDUPE_WINDOW_MS`）。
+
+### 10.2 额度观测带 scope，"不可知"不等于"已耗尽"
+
+- 观测（`observeQuota`）与 renderer 同口径：先解析当前 Coding Plan 连接（`resolveResetScope`），
+  再读 entitlement 快照与重置卡状态；三步各自降级，不因一步失败整体放弃。v2 的快照不带 scope，
+  读不到 `percentage`，派发门因此永远判"不可知 → 守卫重排"。
+- 派发门对 quota 意图的裁定（依次）：
+
+| 观测 | 裁定 |
+| --- | --- |
+| 额度可读且未耗尽，或额度不可知 | 放行派发（不可知时是探测派发，节奏与次数由 §10.4 的阶梯约束） |
+| 已耗尽，且距上次核销成功不足 10 分钟（`RESUME_CLAIM_COOLDOWN_MS`） | 放行探测：快照可能滞后，不重复烧卡也不死等 |
+| 已耗尽，具备核销资格且有可用卡 | **立即核销**，成功后 +10s 派发；卡在但本次核销未确认 / 观测不完整 → 2 分钟后重试 |
+| 已耗尽，其余情况（无卡、未启用自动核销、不具备资格） | 不派发；在 `min(nextResetTime + 60s, now + 10min)` 复核（`resolveExhaustedRecheckAt`） |
+
+- **核销资格**（`mayClaimCard`）：从未核销过，或上次核销之后又出现过真实的额度类失败。只凭
+  "快照仍显示耗尽"不再烧第二张卡（v2 会把卡一张张耗光）。
+- transient 意图到期时若观测显示额度已耗尽，改写为 quota 意图走本门（限流退避不再空转）。
+
+### 10.3 失败即核销
+
+额度类失败在**三个时点**都会即时尝试核销：建意图时、刷新既有 pending 意图时、看门狗派发的 turn
+以额度类失败后（`claimAfterFailure`）。快照可读且明显有余量时不烧卡（失败可能来自别的额度桶或
+瞬时抖动）；provider 明确报用量上限（1308 / 1310）时无视快照直接核销。卡型按 provider 业务码裁决：
+
+| 业务码 | 卡型 |
+| --- | --- |
+| 1310（周 / 月上限） | 只认 WEEK 卡（FIVE_HOUR 卡对它无效，不误烧） |
+| 1308（5 小时窗口）及其余额度类 | 任一可用卡，FIVE_HOUR 优先 |
+| 1309 / 1311 / 1313 | 没有卡能解决，不核销 |
+
+### 10.4 看门狗派发的 turn 失败后的结算（`planDispatchedFailureSettle`，纯函数）
+
+| 归类 | 裁决 |
+| --- | --- |
+| plan_expired / non_recoverable | `exhausted`：既有意图终态化，自动重试无意义 |
+| quota，20 秒内失败（`RESUME_FAST_FAIL_WINDOW_MS`） | 额度并未恢复：**不计 attempt**，按 1 → 5 → 15 → 30 分钟探测阶梯回队；连续快速失败达到 `autoResumeMaxConsecutive` 即 `exhausted` |
+| quota，运行一段时间后才耗尽 | 新的耗尽周期：连续快速失败计数清零，attempt 归零，+10s 回队 |
+| transient | 1 → 5 → 15 分钟退避并计 attempt；运行 ≥ 2 分钟才失败视为有进展，attempt 归零；触顶 `exhausted` |
+| context | 自发压缩至多 `RESUME_MAX_CONTEXT_COMPACTS = 2` 次，仍溢出即 `exhausted`；否则回队并重新武装压缩 |
+| 无法归因 | 保持原类别、计 attempt，触顶 `exhausted` |
+
+attempt 只由本结算路径推进；detector / renderer 上报不推进 attempt。
+
+### 10.5 派发与结局
+
+- **活动判定读 sessions-index 最新态**（running / prewarming / compact 维护工作），不再读 sqlite
+  任务行的 status——那一列只存上一次 outcome，从不为 running（v2 的"任务仍在跑则不派发"从未生效，
+  长任务 1 小时后被重复续跑）。任务仍在活动：+60s 重排，不取消、不派发；持续 2 小时即取消
+  （`task_still_running`，工作继续）。
+- 派发前确保该任务所在 workspace 的 sessions-index 已被宿主摄入（重启后只有用户打开的 workspace
+  才订阅；`sendPrompt` 路径本来就做这件事，看门狗绕过它时必须自己补上），否则续跑 turn 的
+  结局与失败都无人观察。
+- 派发前 `ensureSessionReady`（重启后的后台任务是冷会话），再发 v4 `sendText`
+  （`commandId = inputId`）；**先订阅结局再派发**（额度未恢复时 turn 会在派发调用返回前就失败）；
+  ACK 不是 `accepted` 即按派发失败处理。
+- 启动看护：ACK 已接受但 45 秒后索引仍明确为空闲 → 按派发失败处理，不空等结局超时。
+- 结局等待 60 分钟；到期仍在跑则续等（至多 8 次），**在途期间绝不重复派发**。
+- 派发本身失败（会话无法恢复 / 命令被拒 / turn 未启动）：30 秒后重试，不计 attempt；连续 10 次
+  即 `exhausted`。任何一步失败都不会让行停在 `dispatched`。
+- 结局完成 → 意图删除；用户手动发送消息 → 意图取消（§3.4）。
+- 续跑文案明确"已完成则不要重做"：意图可能早于用户手动续跑，迟到的续跑只回一行说明。
+
+### 10.6 context 溢出：先压缩再续跑
+
+- 派发门（而非失败结算）负责发起压缩：未武装时发 v4 `compact`（已有压缩在跑则复用），之后每
+  15 秒看一次，压缩维护工作结束才放行续跑——绝不在压缩未落地时续跑（必然再次溢出）。
+- 压缩请求连续被拒（草稿会话 / 命令面不可用）达 2 次后放行续跑，由结局裁决；仍溢出则按 §10.4
+  收口为 `exhausted`，绝不无限请求。
+
+### 10.7 重启恢复与调度
+
+- 启动时回收**全部**残留的 `dispatched` 行（v2 只回收 15 分钟前的，崩溃前 15 分钟内派发的意图
+  永远卡死）；同 task 已有 pending 行的残留 `dispatched` 行直接删除（v1/v2 在此撞
+  `idx_resume_pending`，导致恢复整体失效）。
+- 新建意图时清掉同 task 旧的 `exhausted` / `cancelled` 行：自动续跑停止后用户再次失败可以重新开始。
+- tick 定时器总是把最早到期的 pending 意图纳入计算（v2 在有在途结局等待时跳过，其它任务的意图
+  被饿死）；单次定时上限 5 分钟（系统休眠唤醒后的迟到有界）。
+- 本轮刚发卡 / 核销成功后重新观测再进派发门（开头的快照已过期）。
+
+### 10.8 验收补充
+
+- 后台任务（非当前 pane）以 1308 失败：宿主 detector 接纳 → 建意图 → 有卡则核销 → 续跑，全程无需
+  该 pane 可见。
+- 额度不可读（离线 / 快照失败）：放行探测，不进入"每 5 分钟守卫重排"的循环。
+- 核销后续跑 turn 20 秒内再次 1308：不计 attempt，1 分钟后重试；连续 5 次快速失败后停止。
+- 同一失败由 detector 与结局通道同时上报：只结算一次，attempt 恰好推进一次。
+- 续跑 turn 运行 30 分钟后仍正常：不重复派发；结局超时只在索引明确空闲时才按失败结算。
+- SessionPane 重新挂载重报 2 分钟前的旧错误：不建意图。

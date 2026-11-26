@@ -389,6 +389,15 @@ export const commandPayloadSchemas = {
   renameSession: z.object({ title: z.string() }),
   deleteSession: z.object({}),
   discardSharedContext: z.object({ contextId: z.string().trim().min(1) }).strict(),
+  // 自动压缩策略即时应用（chat 输入区 context 面板的开关 / 阈值）。非 CAS、非输入型：
+  // 运行中也立即生效——压缩策略在每个模型步重新读取 runtime.config.compact。
+  // usagePercentTrigger 取 1–99 生效；100 或缺省 = 统一算法（尽量晚压缩）。
+  setAutoCompactPolicy: z
+    .object({
+      enabled: z.boolean(),
+      usagePercentTrigger: z.number().int().min(1).max(100).optional(),
+    })
+    .strict(),
 } as const;
 
 export type CommandType = keyof typeof commandPayloadSchemas;

@@ -1,5 +1,6 @@
 // 模型配置命令组：switchModelConfig（自旧 server-operations.switchModelConfig 语义搬运）
 // + switchCollaborationMode（additive，UI 模式选择器）
+// + setAutoCompactPolicy（自动压缩开关 / 阈值的即时应用）
 // + applyRequestedSessionConfig（createSession.config 消费共用件）。
 // 每个命令组一个文件：handler 纯函数 (host, envelope) → CommandResult|undefined，
 // 决策逻辑直驱 core（app.setModel / app.setMode / runtime.emit*），不经旧协议 op。
@@ -13,6 +14,7 @@ import { V4CommandNoopError } from "../../v4-gateway.js";
 import { runSessionModelConfigMutation } from "../../model-config-mutation.js";
 import { requireRecord } from "../record-access.js";
 import type { V4CommandCoreHost, V4SessionRecordView } from "../types.js";
+import { toRuntimeCompactConfig } from "../../auto-compact-policy.js";
 
 /** 同值切换的 noop reasonCode。 */
 const CONFIG_UNCHANGED = "config.unchanged";
@@ -262,4 +264,25 @@ export async function applyRequestedSessionConfig(
   }
 }
 
-export const modelConfigHandlers = { switchModelConfig, switchCollaborationMode };
+/**
+ * setAutoCompactPolicy：把 chat 输入区 context 面板的自动压缩开关 / 阈值即时应用到本会话。
+ * 纯 runtime 配置写入：不发事件、不改投影、无需 CAS（幂等覆盖）。运行中也立即生效——
+ * 自动压缩 / 微压缩 / token 预算在每个模型步重新读取 runtime.config.compact。
+ * 同值写入也按 accepted 处理（不抛 noop）：Host 按"每会话最后一次下发的策略"去重，
+ * 不依赖 CLI 回报，重启后首次下发必然同值。
+ */
+async function setAutoCompactPolicy(
+  host: V4CommandCoreHost,
+  envelope: CommandEnvelope,
+): Promise<CommandResult | undefined> {
+  const payload = envelope.payload as CommandPayloadMap["setAutoCompactPolicy"];
+  const record = requireRecord(host, envelope.sessionId);
+  record.app.runtime.updateConfig({ compact: toRuntimeCompactConfig(payload) });
+  return undefined;
+}
+
+export const modelConfigHandlers = {
+  switchModelConfig,
+  switchCollaborationMode,
+  setAutoCompactPolicy,
+};

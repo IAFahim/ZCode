@@ -361,3 +361,69 @@ autoResumeMaxConsecutive: z.number().int().min(1).max(20).default(5),
 - **已证伪假设**：v1 结局等待订阅 `onDynamicStreamEvent(sessionId)` 收不到事件（流按
   workspace 路由），为"1 小时间隔循环"的直接根因；`remaining.percentage` 为已用占比，
   为"watchdog 永远 idle"的直接根因。
+
+## 14. v3 实施修订（2026-11-26）
+
+对应 spec §10。v2 的 `quotaWatchdogService` 已增至 1126 行并混合四种职责，v3 按职责拆分
+（均在 800 行上限内），数据模型与 schema 不变：
+
+| 模块 | 职责 |
+| --- | --- |
+| `quotaWatchdogService` | 额度观测（带 scope）、看门狗状态机、tick 循环与定时器、自动核销编排；持有 `lastClaimAt` 等宿主全局簿记 |
+| `quotaResumeTracker` | 每任务的失败接纳（三条通道同一入口、task 锁内去重）、意图建立 / 刷新、派发、结局等待与结算 |
+| `quotaResumeSettlement` | 结算纯函数 `planDispatchedFailureSettle` 与阶梯常量（无 IO、无时钟） |
+| `quotaResumeGate` | 派发前裁定：context 先压缩、quota 核销 / 等重置 / 放行探测、transient 转 quota |
+| `quotaWatchdogDomain` | 归类、卡型裁决、观测口径与全部时间常量（单一出处） |
+
+**失败事实入口**（`zcodeTaskIndexSyncer`）：
+
+- 新增 `onSessionError(event)`：`resyncTaskIndexRowFromAgent(…, "phase.error")` 时发出，载荷取
+  `projection.lastError` 的 code（缺省回退 type）/ message / attribution；辅助会话不发。
+- 新增 `onSessionRunning(target)`：sessions-index 的 phase 由 draft / 终态迁入 running 时发出。
+- 新增 `getSessionActivity(sessionId)` 与 `liveSessionRefs()`：活动事实来自常开摄入的 summary，
+  不来自 sqlite 任务行（`rowToMeta` 的 status 只反映 `cli_last_outcome`，从不为 running）。
+
+**派发 port**（`node.ts` 装配）：
+
+```ts
+interface QuotaResumeDispatchPort {
+  getTaskActivity(target): "active" | "idle" | "unknown"; // running / prewarming / compact 工作 → active
+  isCompactWorkActive(sessionId): boolean;
+  sendResumeText(input): Promise<"accepted" | "duplicate" | "noop">;
+  requestCompact(target): Promise<"accepted" | "alreadyRunning" | "rejected">;
+  subscribeOutcome(input): TurnOutcomeWait; // 终态通道 + isOutcomeForInput 过滤
+}
+```
+
+- 三个方法入口都先 `zcodeTaskIndexSyncer.ensureSessionSubscription(target)`：结局与失败检测建立在
+  task index 的常开摄入上，而摄入按 workspace 订阅（dormant 占位在 runtime 就绪后自动转正）。
+- `sendResumeText` / `requestCompact` 先 `zcodeAgentService.ensureSessionReady(target)` 再发 v4 命令。
+  不再走 `zcodeTaskService.sendPrompt`：它要求 task target 已被 UI 记住，重启后对后台任务必然抛
+  `ZCODE_SESSION_TARGET_NOT_FOUND`。
+- 结局只走 task index 的常开终态通道（`onDynamicTaskTerminalOutcome`），按 `inputId` 过滤；
+  v2 的 workspace 维度流订阅不再使用。
+- syncer 构造早于看门狗：`onSessionError` 经后绑定的 ref 接到
+  `QuotaWatchdogService.handleSessionFailure`；`autoCompactPolicySync` 是纯编排，构造顺序无约束，
+  `onSessionRunning` 直接闭包接入 `syncOnTurnStart`。
+
+**意图仓库**（`resumeIntentRepo.ts`）：`getActiveByTask`、`recoverStaleDispatched(now, { olderThanMs })`
+（init 传 0 回收全部残留行，同 task 已有 pending 行的残留行删除）、`upsertPending` 新建时清理同 task
+的 `exhausted` / `cancelled` 行。无 schema 变更。
+
+**自动压缩策略的即时下发**（同一提交，见 [context-window-usage-state.md](../context-window-usage-state.md)）：
+新增 v4 命令 `setAutoCompactPolicy`（非 CAS、非行定位），Host 端 `session/autoCompactPolicySync.ts`
+在设置变更与会话开始新一轮时下发；CLI 端 `runtime.updateConfig({ compact })` 原地更新，
+`runtime.getAutoCompactPolicy()` 供分支继承（叶子映射在 v4 原生层
+`zcode-protocol-v4/auto-compact-policy.ts`——v4 原生层不得 import 旧协议目录）。
+
+**已证伪假设（v3 开发中）**：结局通道携带归因（实际只到"这一轮失败了"，归因由随后的 detector
+带回——无归因结局须短暂让位给 detector，见 `deferUnattributedOutcome`）；绕过 `sendPrompt` 的直发
+路径不需要额外订阅（workspace 的 sessions-index 摄入并非全局常开）。
+
+**已证伪假设（v2）**：`getEntitlementSnapshot()` 不带 scope 也能读到 `percentage`（读不到，是"每 5 分钟
+守卫重排"的直接根因）；sqlite 任务行的 status 能表达 running（不能）；结局通道可以先释放记录再结算
+（记录被当作已结算，失败被整体丢弃）；去重可以放在 task 锁之外（两条通道并发时 attempt 永不推进）。
+
+**验证边界**：以上行为由单测覆盖（规则 37 + 端到端 20 + 意图仓库 17），端到端用例用真实 sqlite 仓库、
+假 usage / 假派发 port 与可控时钟；真实额度中断、真实 `/use` 核销与 UI → Host → CLI 的策略下发
+未在运行中的应用里触发验证。

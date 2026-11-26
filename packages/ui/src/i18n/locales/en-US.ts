@@ -7868,8 +7868,10 @@ const enUS: Record<string, string> = {
   // Start Plan per-bucket quota reminders
   // Quota watchdog auto-resume (docs/quota-watchdog/spec.md)
   "chat.autoResume.armedQuota":
-    "Task failed — it will resume automatically once the plan quota resets.",
+    "Task failed — it will resume automatically (reset card if one is available, otherwise when the quota resets).",
   "chat.autoResume.armedTransient": "Task failed — it will retry automatically in a few minutes.",
+  "chat.autoResume.armedContext":
+    "Task failed — the context is full; it will compact and resume automatically.",
   "chat.quota.startPlan.bucketDailyLow":
     "{model} has {percent} of its daily quota remaining ({remaining} tokens).",
   "chat.quota.startPlan.bucketActivityLow":

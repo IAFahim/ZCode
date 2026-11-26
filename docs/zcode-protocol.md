@@ -64,7 +64,7 @@ epoch、CAS 和 product guard 裁决。
 | 生成控制      | `stop`、`compact`、`retryTurn`、`editUserQuery`、`forkAssistant`                                                                     |
 | 文件回退      | `applyFileRewind`                                                                                                                    |
 | 队列          | `sendQueuedNow`、`lockQueueItemEdit`、`editQueueItem`、`releaseQueueItemEdit`、`reorderQueueItem`、`deleteQueueItem`、`setAutoDrain` |
-| 配置          | `switchModelConfig`、`switchCollaborationMode`、`setFollowupMode`                                                                    |
+| 配置          | `switchModelConfig`、`switchCollaborationMode`、`setFollowupMode`、`setAutoCompactPolicy`（非 CAS，运行中即时生效，见 [context-window-usage-state.md](context-window-usage-state.md)） |
 | Goal/后台工作 | `pauseGoal`、`resumeGoal`、`cancelBackgroundWork`                                                                                    |
 | 阻塞交互      | `resolveInteraction`、`snoozeInteractionAutoResolution`                                                                              |
 

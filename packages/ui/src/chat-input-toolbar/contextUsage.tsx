@@ -230,9 +230,17 @@ export function getContextCompressionCommand(_provider: ZCodeProvider): string {
 }
 
 // 自动压缩设置（protocol.ts autoCompactEnabled / autoCompactThresholdPercent）：
-// context 面板内联开关；设置在新建/冷恢复 Session 时进入 Runtime compact 配置。
-// 100 = 统一算法（尽量晚）；<100 走 usagePercentTrigger（policy.ts）。
-const AUTO_COMPACT_THRESHOLD_OPTIONS = [100, 90, 75, 50] as const;
+// context 面板内联开关；设置在新建/冷恢复 Session 时进入 Runtime compact 配置，
+// 变更时经 Host 即时下发到 live 会话（autoCompactPolicySync），运行中也立即生效。
+// 100 = 统一算法（尽量晚）；<100 走 usagePercentTrigger（policy.ts，按完整窗口取阈值）。
+const AUTO_COMPACT_THRESHOLD_OPTIONS = [100, 90, 75, 50, 30, 20, 10] as const;
+/** 窗口大小未知时只提供对任何窗口都安全的档位。 */
+const AUTO_COMPACT_SAFE_OPTIONS = new Set<number>([100, 90, 75, 50]);
+/**
+ * 低于该 token 数的触发点不提供：压缩后的基线（系统提示 + 工具定义 + 摘要）通常已有几万 token，
+// 阈值低于基线会在每个模型步反复触发压缩（上游有 rapid-refill 熔断，但白白浪费一次压缩）。
+ */
+const MIN_AUTO_COMPACT_THRESHOLD_TOKENS = 64_000;
 
 // 自动/运营完成（startedAt 为空）当前生效的 used_at；手动完成不进入触发器交互。
 function resolveAutomaticCompletedAt(entry: CodingPlanQuotaResetUiEntry | null): number | null {
@@ -322,6 +330,15 @@ export function ChatContextUsage({
     }
   }, []);
   const renderableTaskUsage = getRenderableTaskUsage(taskUsage);
+  // 只提供对当前模型窗口有意义的档位；当前已选值即使不在候选内也保留显示，避免"设置消失"。
+  const autoCompactThresholdOptions = AUTO_COMPACT_THRESHOLD_OPTIONS.filter((pct) => {
+    if (pct === autoCompactThresholdPercent) return true;
+    const windowTokens = renderableTaskUsage?.size;
+    if (typeof windowTokens !== "number" || !Number.isFinite(windowTokens) || windowTokens <= 0) {
+      return AUTO_COMPACT_SAFE_OPTIONS.has(pct);
+    }
+    return pct === 100 || (windowTokens * pct) / 100 >= MIN_AUTO_COMPACT_THRESHOLD_TOKENS;
+  });
   const codingPlanUsageRemainingWithClose = useMemo<
     ChatCodingPlanUsageRemainingConfig | undefined
   >(() => {
@@ -1022,12 +1039,13 @@ export function ChatContextUsage({
                 />
               </div>
               {autoCompactEnabled ? (
-                <div className="flex items-center justify-between gap-3 text-ui-sm">
-                  <span className="text-foreground-subtle">
+                // 档位最多 7 个：标签与档位分行、档位可换行，窄面板下不会溢出悬浮卡片。
+                <div className="space-y-1.5 text-ui-sm">
+                  <span className="block text-foreground-subtle">
                     {intl.formatMessage({ id: "chat.contextUsage.autoCompactAt" })}
                   </span>
-                  <div className="flex items-center gap-1">
-                    {AUTO_COMPACT_THRESHOLD_OPTIONS.map((pct) => (
+                  <div className="flex flex-wrap items-center gap-1">
+                    {autoCompactThresholdOptions.map((pct) => (
                       <button
                         aria-pressed={pct === autoCompactThresholdPercent}
                         className={cn(

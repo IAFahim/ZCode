@@ -392,19 +392,70 @@ export {
   classifyTurnFailure,
   computeWakeDelayMs,
   createInitialWatchdogStatus,
+  hasUsableResetCard,
   isOpportunityThrottleError,
   isOpportunityTransientError,
   nextOpportunityCooldownUntil,
+  observeQuotaUsage,
+  quotaProbeDelayMs,
   remainingPercentFromEntitlement,
   resolveClaimTarget,
+  resolveExhaustedRecheckAt,
   shouldAttemptOpportunityCall,
+  transientRetryDelayMs,
   transitionOnObservationError,
   transitionWatchdogState,
   watchdogPollDelayMs,
+  QUOTA_EXHAUSTED_REMAINING_PERCENT,
   QUOTA_WATCHDOG_CLAIM_THRESHOLD_PERCENT,
+  RESUME_ACTIVE_DEFER_LIMIT_MS,
+  RESUME_ACTIVE_DEFER_MS,
+  RESUME_AFTER_CLAIM_DELAY_MS,
+  RESUME_CLAIM_COOLDOWN_MS,
+  RESUME_COMPACT_WAIT_MS,
+  RESUME_FAST_FAIL_WINDOW_MS,
+  RESUME_MAX_DISPATCH_ERRORS,
+  RESUME_QUOTA_MAX_RECHECK_MS,
+  RESUME_QUOTA_PROBE_BACKOFF_MS,
   WATCHING_CADENCE_MAX_MS,
   WATCHING_CADENCE_MIN_MS,
+  type QuotaUsageObservation,
+  type ResumeFailureClassification,
+  type WatchdogRuntimeStatus,
 } from "./usage-stats/quotaWatchdogDomain.js";
+export {
+  createQuotaResumeGate,
+  mayClaimCard,
+  unknownQuotaObservation,
+  type QuotaObservation,
+  type QuotaResumeGate,
+  type QuotaResumeGateDeps,
+} from "./usage-stats/quotaResumeGate.js";
+export {
+  planDispatchedFailureSettle,
+  resumeInitialDelayMs,
+  RESUME_MAX_COMPACT_REJECTS,
+  RESUME_MAX_CONTEXT_COMPACTS,
+  RESUME_PROGRESS_WINDOW_MS,
+  type ResumeAttemptDelta,
+  type ResumeSettleAction,
+} from "./usage-stats/quotaResumeSettlement.js";
+export {
+  QuotaResumeTracker,
+  createResumeTaskBookkeeping,
+  isOutcomeForInput,
+  type QuotaResumeTrackerDeps,
+  type ResumeTaskBookkeeping,
+  type TaskActivity,
+} from "./usage-stats/quotaResumeTracker.js";
+export {
+  createAutoCompactPolicySync,
+  isLiveLifecycleState,
+  resolveAutoCompactPolicy,
+  type AutoCompactPolicy,
+  type AutoCompactPolicySync,
+  type AutoCompactPolicySyncDeps,
+} from "./session/autoCompactPolicySync.js";
 // host 域终态回填 files_changed 复用现有 task diff 汇总。
 export { buildTaskChangeSummary } from "./session/taskChangeSummary.js";
 export { OffPeakTaskService } from "./session/offPeakTaskService.js";
@@ -521,7 +572,10 @@ import { buildAgentTelemetrySpawnEnv } from "./zcode-agent/agentTelemetryEnv.js"
 import { resolveZCodeAgentPresentationSurface } from "./zcode-agent/zcodeAgentPresentationSurface.js";
 import { createZCodeTaskServiceAdapter } from "./zcode-agent/zcodeTaskServiceAdapter.js";
 import { createZCodeSessionService } from "./zcode-session/zcodeSessionService.js";
-import { createZCodeTaskIndexSyncer } from "./zcode-agent/zcodeTaskIndexSyncer.js";
+import {
+  createZCodeTaskIndexSyncer,
+  type ZCodeTaskIndexSessionErrorEvent,
+} from "./zcode-agent/zcodeTaskIndexSyncer.js";
 import { TaskIndexRepo } from "./session/taskIndexRepo.js";
 import { AutomationRepo } from "#src/session/automationRepo.js";
 import type { AppSettings } from "@zcode/shared";
@@ -587,12 +641,12 @@ import { createUsageStatsService } from "./usage-stats/usageStatsService.js";
 import {
   QuotaWatchdogService,
   type QuotaResumeDispatchPort,
+  type TurnOutcomeWaitResult,
 } from "./usage-stats/quotaWatchdogService.js";
+import { isOutcomeForInput, type QuotaResumeTarget } from "./usage-stats/quotaResumeTracker.js";
 import { ResumeIntentRepo } from "./session/resumeIntentRepo.js";
-import {
-  createHostCommandEnvelope,
-  sendHostCasCommandV4,
-} from "./zcode-agent/zcodeV4HostCommand.js";
+import { createAutoCompactPolicySync } from "./session/autoCompactPolicySync.js";
+import { createHostCommandEnvelope } from "./zcode-agent/zcodeV4HostCommand.js";
 import type { CodingPlanResetScopeRequest } from "@zcode/shared";
 import { createCodingPlanSubscriptionService } from "./coding-plan-subscription/codingPlanSubscriptionService.js";
 import { createClientConfigService } from "./client-config/clientConfigService.js";
@@ -2726,9 +2780,50 @@ export function createLocalServices(options: {
   // mapServiceEvent 路径，导致 task_complete 永远不会写回 sqlite，侧边栏 spinner 不停。
   // 在 services 层装配一个共享的 taskIndexRepo + syncer，session 任意入口都会唤醒
   // shadow 订阅，把 runtime 终态收敛进 sqlite。
+  // 配额守护自动续跑（docs/quota-watchdog/spec.md §9.2）：会话真实失败的宿主侧检测入口。
+  // 适配器构造早于看门狗，经 ref 后接线；看门狗未装配时为 no-op。
+  const quotaWatchdogFailureRef: {
+    current: (event: ZCodeTaskIndexSessionErrorEvent) => void;
+  } = { current: () => {} };
+  // 自动压缩策略即时下发（chat 输入区 context 面板开关 / 阈值）：设置变更 → 所有 live 会话；
+  // 会话开始新一轮 → 策略不一致时补发。只向确认 live 的会话发命令（见 autoCompactPolicySync）。
+  const autoCompactPolicyLogger = createServiceLogger("auto-compact-policy");
+  const autoCompactPolicySync = createAutoCompactPolicySync({
+    readSettings: () => settingService.get(),
+    listCandidateSessions: () => zcodeTaskIndexSyncer.liveSessionRefs(),
+    getSessionActivity: (sessionId) => zcodeTaskIndexSyncer.getSessionActivity(sessionId),
+    getSessionLifecycle: (target) => zcodeAgentService.getSessionLifecycle(target),
+    sendPolicy: async ({ sessionId, workspacePath, workspaceIdentity }, policy) => {
+      const ack = await zcodeAgentService.sendConversationCommandV4({
+        workspacePath,
+        ...(workspaceIdentity ? { workspaceIdentity } : {}),
+        envelope: createHostCommandEnvelope({
+          type: "setAutoCompactPolicy",
+          payload: policy,
+          sessionId,
+        }),
+      });
+      if (ack.status !== "accepted") {
+        throw new Error(
+          `setAutoCompactPolicy ack=${ack.status}${ack.reasonCode ? ` (${ack.reasonCode})` : ""}`,
+        );
+      }
+    },
+  });
   const zcodeTaskIndexSyncer = createZCodeTaskIndexSyncer({
     agentService: zcodeAgentService,
     taskIndexRepo,
+    // 任何会话（含后台任务）running → error 的真实迁移都交给看门狗：不再依赖 renderer
+    // 是否打开该会话（v2 的唯一失败来源是 SessionPane 上报）。
+    onSessionError: (event) => quotaWatchdogFailureRef.current(event),
+    onSessionRunning: (target) => {
+      void autoCompactPolicySync.syncOnTurnStart(target).catch((error: unknown) => {
+        autoCompactPolicyLogger.warn("auto-compact policy sync on turn start failed", {
+          sessionId: target.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    },
     // v4 命令只返回准入回执，退出保护必须消费权威会话状态而不是 RPC 在途数。
     reportActiveSessionCount: options?.taskRuntimeReporter?.onActiveSessionCountChanged
       ? (runningTaskCount) =>
@@ -2843,6 +2938,18 @@ export function createLocalServices(options: {
         count > 0 ? [{ kind: "worktree-creating", count }] : [],
       ),
     afterChange: publishProjectChange,
+  });
+  settingService.onDidUpdate((event) => {
+    if (
+      event.keys.includes("autoCompactEnabled") ||
+      event.keys.includes("autoCompactThresholdPercent")
+    ) {
+      void autoCompactPolicySync.syncLiveSessions().catch((error: unknown) => {
+        autoCompactPolicyLogger.warn("auto-compact policy sync failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
   });
   // 配额守护自动续跑：用户手动发送 prompt 即取消该 task 的在途自动续跑意图（spec §3.4
   // "新消息/编辑即取消"；v2 修订：v1 从未接线，自动续跑会抢在用户手动 continue 之前重复派发）。
@@ -3137,110 +3244,154 @@ export function createLocalServices(options: {
         const resumeIntentRepo = new ResumeIntentRepo();
         sqliteReposToClose.push(resumeIntentRepo);
         const quotaWatchdogLogger = createServiceLogger("quota-watchdog");
-        // 自动续跑派发 port：retryTurn 优先（host CAS 探测），失败回退 attributed sendText。
+        // 自动续跑派发 port（v3）。两个要点：
+        // 1. 活动状态读 sessions-index 最新态——sqlite 任务行的 status 只存上一次 outcome，
+        //    从不为 running；v2 的 isTaskActive 因此恒为 false（长任务 1h 后被重复续跑）。
+        // 2. 派发前先 ensureSessionReady：历史会话的 record 只由订阅路径激活，重启后的后台任务
+        //    是冷的，直接发命令会被拒；同时不再走 zcodeTaskService.sendPrompt——它要求
+        //    task target 已被 UI "记住"，重启后对后台任务必然抛 ZCODE_SESSION_TARGET_NOT_FOUND。
+        // 续跑文案必须写明"已完成则不要重做"：意图可能早于用户手动续跑（用户自己把任务做完了，
+        // 旧意图却留了下来），迟到的续跑不得让 agent 重做或重复已完成的收尾（例如重复发布）。
         const RESUME_PROMPT_TEXT =
-          "The previous run was interrupted by a recoverable error (usage limit or transient API failure). Continue the interrupted task exactly where you left off.";
+          "The previous run was interrupted by a recoverable error (usage limit or transient API failure). Continue the interrupted task exactly where you left off. If the work was already finished (for example you resumed it yourself), do not redo any of it: reply in one line that it is already complete.";
+        const sessionTargetOf = ({
+          taskId,
+          workspacePath,
+          workspaceIdentity,
+        }: {
+          taskId: string;
+          workspacePath: string;
+          workspaceIdentity?: string;
+        }) => ({
+          sessionId: taskId,
+          workspacePath,
+          ...(workspaceIdentity ? { workspaceIdentity } : {}),
+        });
+        // 失败检测与结局通道都建立在 task index 的常开摄入上（sessions-index → summary →
+        // 终态 / phase.error 回源）。摄入按 workspace 订阅，后台任务所在 workspace 未必已订阅
+        //（重启后只有用户打开的 workspace 才订阅）。zcodeTaskService.sendPrompt 路径经
+        // notifySyncerSession 保证这一点；本 port 绕过了它，必须自己补上，否则续跑 turn 的
+        // 结局与失败都无人观察：意图停在 dispatched 直到 8 小时后被取消。
+        // 只订阅 workspace 索引，不启动 CLI、不激活会话（dormant 占位在 runtime 就绪后自动转正）。
+        const ensureTaskIndexed = (target: QuotaResumeTarget) => {
+          zcodeTaskIndexSyncer.ensureSessionSubscription(sessionTargetOf(target));
+        };
         const quotaResumeDispatchPort: QuotaResumeDispatchPort = {
-          isTaskActive: async ({ taskId, workspacePath, workspaceIdentity }) => {
-            const meta = await zcodeTaskService.getTaskMeta({
-              taskId,
-              workspacePath,
-              ...(workspaceIdentity ? { workspaceIdentity } : {}),
-            });
-            // persist status："running" 即有在途 turn（completed/error/idle 均可派发）。
-            return meta?.status === "running";
+          getTaskActivity: ({ taskId }) => {
+            const summary = zcodeTaskIndexSyncer.getSessionActivity(taskId);
+            if (!summary) return "unknown";
+            return summary.phase === "running" ||
+              summary.phase === "prewarming" ||
+              summary.hasCompactWork === true
+              ? "active"
+              : "idle";
           },
-          retryTurn: async ({
-            sessionId,
-            workspacePath,
-            workspaceIdentity,
-            rowTarget,
-            resumeIntentId,
-          }) => {
-            await sendHostCasCommandV4({
-              send: (envelope) =>
-                zcodeAgentService.sendConversationCommandV4({
-                  workspacePath,
-                  ...(workspaceIdentity ? { workspaceIdentity } : {}),
-                  envelope,
-                }),
-              type: "retryTurn",
-              payload: { target: rowTarget },
-              sessionId,
-              contextMessage: `quota-watchdog resume session=${sessionId} intent=${resumeIntentId}`,
-            });
-          },
-          sendResumeText: async ({ sessionId, resumeIntentId }) => {
-            await zcodeTaskService.sendPrompt({
-              taskId: sessionId,
-              traceId: `resume-${resumeIntentId}`,
-              content: RESUME_PROMPT_TEXT,
+          isCompactWorkActive: (sessionId) =>
+            zcodeTaskIndexSyncer.getSessionActivity(sessionId)?.hasCompactWork === true,
+          sendResumeText: async ({ resumeIntentId, inputId, ...target }) => {
+            ensureTaskIndexed(target);
+            await zcodeAgentService.ensureSessionReady(sessionTargetOf(target));
+            // 与 zcodeTaskService.sendPrompt 的 v4 主路径同形：commandId 即本轮 inputId。
+            const ack = await zcodeAgentService.sendConversationCommandV4({
+              workspacePath: target.workspacePath,
+              ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
               clientMode: "desktop-continuous",
-              resumeIntentId,
+              envelope: createHostCommandEnvelope({
+                type: "sendText",
+                payload: {
+                  text: RESUME_PROMPT_TEXT,
+                  heldQueueDisposition: "keepQueueAndSend",
+                  resumeIntentId,
+                },
+                sessionId: target.taskId,
+                commandId: inputId,
+              }),
             });
+            if (ack.status === "accepted") return "accepted";
+            if (ack.status === "duplicate" || ack.status === "noop") return ack.status;
+            throw new Error(
+              `resume command rejected (${ack.status}${ack.reasonCode ? `: ${ack.reasonCode}` : ""})`,
+            );
           },
-          requestCompact: async ({ sessionId, workspacePath, workspaceIdentity }) => {
+          requestCompact: async (target) => {
+            ensureTaskIndexed(target);
+            await zcodeAgentService.ensureSessionReady(sessionTargetOf(target));
             // v4 compact 是非 CAS 输入型命令（idle 立即执行 / busy 进 FIFO），无需 baseRevision。
-            await zcodeAgentService.sendConversationCommandV4({
-              workspacePath,
-              ...(workspaceIdentity ? { workspaceIdentity } : {}),
+            const ack = await zcodeAgentService.sendConversationCommandV4({
+              workspacePath: target.workspacePath,
+              ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
               envelope: createHostCommandEnvelope({
                 type: "compact",
                 payload: {},
-                sessionId,
+                sessionId: target.taskId,
               }),
             });
+            quotaWatchdogLogger.info("context compact command ack", {
+              taskId: target.taskId,
+              status: ack.status,
+              reasonCode: ack.reasonCode ?? null,
+            });
+            if (ack.status === "accepted") return "accepted";
+            if (ack.status === "duplicate" || ack.status === "noop") return "alreadyRunning";
+            return "rejected";
           },
-          awaitTurnOutcome: ({ sessionId, workspacePath, workspaceIdentity, timeoutMs }) =>
-            new Promise((resolve) => {
-              let settled = false;
-              const settle = (value: {
-                outcome: "completed" | "failed";
-                errorMessage?: string;
-                errorCode?: string | null;
-                attributionReason?: string | null;
-              }) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                streamDisposable.dispose();
-                terminalDisposable.dispose();
-                resolve(value);
-              };
-              // v2 修正：v1 订阅 onDynamicStreamEvent(sessionId) 收不到事件（流按 workspace 路由，
-              // 结局等待全超时 → 每轮恰好 1h 后才回队）。改为 workspace 维度流订阅 + 终态订阅双通道，
-              // 后者基于 task index 常开订阅，renderer 是否观看均可靠。
-              const streamDisposable = zcodeTaskService.onDynamicTaskEvent({
-                workspacePath,
-                ...(workspaceIdentity ? { workspaceIdentity } : {}),
-                taskId: sessionId,
-              })((event) => {
-                if (event.type === "task_complete") {
-                  settle({ outcome: "completed" });
-                } else if (event.type === "task_error") {
-                  settle({
-                    outcome: "failed",
-                    errorMessage: event.error,
-                    errorCode: event.code ?? null,
-                    attributionReason: event.attribution?.reason ?? null,
-                  });
-                }
-              });
-              const terminalDisposable = zcodeTaskService.onDynamicTaskTerminalOutcome(sessionId)((
-                terminal,
-              ) => {
+          // 结局通道只取 always-on 的终态订阅（task index 常开，renderer 是否观看均可靠）：
+          // 失败的归因细节由宿主 detector（回源快照的权威 lastError）提供，这里只需"这一轮结束了没有"。
+          subscribeOutcome: ({
+            taskId,
+            workspacePath,
+            workspaceIdentity,
+            expectedInputId,
+            timeoutMs,
+          }) => {
+            ensureTaskIndexed({ taskId, workspacePath, workspaceIdentity });
+            let settled = false;
+            let resolveResult: (value: TurnOutcomeWaitResult) => void = () => {};
+            const result = new Promise<TurnOutcomeWaitResult>((resolve) => {
+              resolveResult = resolve;
+            });
+            const disposables: Array<{ dispose(): void }> = [];
+            let timer: NodeJS.Timeout | null = null;
+            const cleanup = () => {
+              if (timer) clearTimeout(timer);
+              timer = null;
+              for (const disposable of disposables.splice(0)) disposable.dispose();
+            };
+            const finish = (value: TurnOutcomeWaitResult) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolveResult(value);
+            };
+            disposables.push(
+              zcodeTaskService.onDynamicTaskTerminalOutcome(taskId)((terminal) => {
+                // 不是这一轮的终态（用户手动的 input 等）一律忽略。
+                if (!isOutcomeForInput(terminal.inputId, expectedInputId)) return;
                 if (terminal.outcome === "succeeded") {
-                  settle({ outcome: "completed" });
+                  finish({ outcome: "completed" });
                 } else if (terminal.outcome === "failed") {
-                  settle({ outcome: "failed", errorMessage: terminal.error });
+                  finish({ outcome: "failed", errorMessage: "resume turn failed" });
                 }
-                // stopped：用户主动停止——意图由用户活动钩子取消，这里不收口。
-              });
-              const timer = setTimeout(
-                () => settle({ outcome: "failed", errorMessage: "dispatch outcome timeout" }),
-                timeoutMs ?? 60 * 60_000,
-              );
-            }),
+              }),
+            );
+            timer = setTimeout(
+              () =>
+                finish({
+                  outcome: "failed",
+                  errorMessage: "resume turn outcome timed out",
+                  timedOut: true,
+                }),
+              timeoutMs,
+            );
+            // dispose 只释放资源、不结算：调用方已在自己的路径上收口这行意图。
+            return {
+              result,
+              dispose: () => {
+                settled = true;
+                cleanup();
+              },
+            };
+          },
         };
         const quotaWatchdog = new QuotaWatchdogService({
           usageStatsService: usageStatsServiceImpl,
@@ -3264,6 +3415,21 @@ export function createLocalServices(options: {
         });
         // 用户手动输入 → 取消在途自动续跑意图（后接线，见上方 ref 声明处注释）。
         quotaWatchdogUserCancelRef.current = quotaWatchdog.cancelAutoResume.bind(quotaWatchdog);
+        quotaWatchdogFailureRef.current = (event) => {
+          void quotaWatchdog.handleSessionFailure({
+            taskId: event.target.sessionId,
+            workspacePath: event.target.workspacePath,
+            ...(event.target.workspaceIdentity
+              ? { workspaceIdentity: event.target.workspaceIdentity }
+              : {}),
+            code: event.code,
+            providerErrorCode: event.attribution?.providerErrorCode ?? null,
+            message: event.message,
+            attributionReason: event.attribution?.reason ?? null,
+            source: event.attribution?.source ?? null,
+            via: "detector",
+          });
+        };
         return Object.assign(usageStatsServiceImpl, {
           reportAutoResumeFailure: quotaWatchdog.reportAutoResumeFailure.bind(quotaWatchdog),
           cancelAutoResume: quotaWatchdog.cancelAutoResume.bind(quotaWatchdog),

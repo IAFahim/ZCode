@@ -25,6 +25,7 @@ import {
   type ChildClientPortsContext,
   type ClientFacingPorts,
 } from "../helpers/child-client-ports.js";
+import type { AutoCompactPolicyConfig } from "../../compact/index.js";
 import type { AgentRuntimeConfig, ActiveTurnInfo } from "../types.js";
 import type { AgentRuntimeInternal } from "../internal.js";
 import { cloneModelSelection } from "../model-selection.js";
@@ -52,7 +53,7 @@ export async function setExecutionState(
 
 export function updateConfig(
   this: AgentRuntimeInternal,
-  patch: Pick<AgentRuntimeConfig, "mode" | "planEnabled" | "outputStyle">,
+  patch: Pick<AgentRuntimeConfig, "mode" | "planEnabled" | "outputStyle" | "compact">,
 ): void {
   if (patch.mode !== undefined || patch.planEnabled !== undefined) {
     const previous = resolveExecutionState(this.config);
@@ -65,6 +66,20 @@ export function updateConfig(
     this.config.outputStyle = patch.outputStyle;
     if (!this.activeTurn) {
       rebuildContextPrefix(this);
+    }
+  }
+  if ("compact" in patch) {
+    // 自动压缩策略即时应用（v4 setAutoCompactPolicy）：原地更新而不是换对象——
+    // context builder 等处持有同一引用；未出现在 patch 里的旧字段一并清掉
+    //（例如阈值从 50% 调回 100% 时必须删掉 usagePercentTrigger）。
+    if (patch.compact === undefined) {
+      delete this.config.compact;
+    } else {
+      const current = (this.config.compact ??= {});
+      for (const key of Object.keys(current) as Array<keyof AutoCompactPolicyConfig>) {
+        if (!(key in patch.compact)) delete current[key];
+      }
+      Object.assign(current, patch.compact);
     }
   }
 }
@@ -80,6 +95,20 @@ export function getSessionShellSelection(
   this: AgentRuntimeInternal,
 ): ExecutionShellSelection | undefined {
   return readSessionShellSelection(this);
+}
+
+/**
+ * 当前生效的自动压缩策略（enabled / usagePercentTrigger）。
+ * 给协议层读取：分支会话继承父会话的策略，不必（也不能）直接访问 runtime.config。
+ */
+export function getAutoCompactPolicy(
+  this: AgentRuntimeInternal,
+): Pick<AutoCompactPolicyConfig, "enabled" | "usagePercentTrigger"> {
+  const { enabled, usagePercentTrigger } = this.config.compact ?? {};
+  return {
+    ...(enabled === undefined ? {} : { enabled }),
+    ...(usagePercentTrigger === undefined ? {} : { usagePercentTrigger }),
+  };
 }
 
 export function getMode(this: AgentRuntimeInternal): CollaborationMode {

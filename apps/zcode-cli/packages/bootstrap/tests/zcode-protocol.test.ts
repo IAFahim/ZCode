@@ -7650,6 +7650,9 @@ describe("ZCodeProtocolAgentServer", () => {
             readTarget: async () => await store.readTarget({ sessionID: app.sessionId }),
             runtime: {
               ...app.runtime,
+              // 父会话当前生效的自动压缩策略（含运行中经 setAutoCompactPolicy 收到的更新）：
+              // fork 与 selection 子会话都必须继承（曾硬编码"开启 + 统一算法"）。
+              getAutoCompactPolicy: () => ({ enabled: false, usagePercentTrigger: 40 }),
               createSelectionSideConversation: async () => {
                 if (!(await store.getSession(selectionChildId))) {
                   await store.createSession({
@@ -7796,6 +7799,8 @@ describe("ZCodeProtocolAgentServer", () => {
       expect(createdAppOptions[1]?.runtimeConfig?.nativeSearchEnhancementsEnabled).toBe(false);
       expect(createdAppOptions[1]?.runtimeConfig?.memory?.enabled).toBe(false);
       expect(createdAppOptions[1]?.runtimeConfig?.modelContextBudgetStrategy).toBe("preflight-v1");
+      // 关闭自动压缩时阈值不写入；分支继承的是父会话当前值而不是默认值。
+      expect(createdAppOptions[1]?.runtimeConfig?.compact).toEqual({ enabled: false });
       expect(result.snapshot.session.target).toMatchObject({
         objective: "Fork inherits parent goal target",
         sessionId: "sess_forked",
@@ -7839,6 +7844,7 @@ describe("ZCodeProtocolAgentServer", () => {
       expect(createdAppOptions[2]?.runtimeConfig?.nativeSearchEnhancementsEnabled).toBe(false);
       expect(createdAppOptions[2]?.runtimeConfig?.memory?.enabled).toBe(false);
       expect(createdAppOptions[2]?.runtimeConfig?.modelContextBudgetStrategy).toBe("preflight-v1");
+      expect(createdAppOptions[2]?.runtimeConfig?.compact).toEqual({ enabled: false });
       expect((await store.getSession(selectionChildId))?.taskType).toBe("selection_side_chat");
     } finally {
       await store.close();

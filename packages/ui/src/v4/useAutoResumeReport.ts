@@ -20,7 +20,7 @@ const TRANSIENT_RATE_LIMIT_CODES = new Set(["429", "3002", "2007", "1302", "1303
 /** 额度耗尽类业务码（provider error code 与会话 code 同口径，见 failure-provider-business-codes.ts）。 */
 const QUOTA_PROVIDER_ERROR_CODES = new Set(["1005", "1304", "1308", "1310", "1313"]);
 
-export type AutoResumeFailureKind = "quota" | "transient";
+export type AutoResumeFailureKind = "quota" | "transient" | "context";
 
 export function classifyAutoResumeFailure(params: {
   error: Pick<SessionErrorInfo, "code" | "message" | "source" | "attribution">;
@@ -43,6 +43,9 @@ export function classifyAutoResumeFailure(params: {
   }
   if (resolveGlmQuotaBannerBusinessCode(error.code) !== null) {
     return "quota";
+  }
+  if (error.attribution?.reason === "context_exceeded" || error.code === "model_context_exceeded") {
+    return "context";
   }
   if ((error.code && TRANSIENT_RATE_LIMIT_CODES.has(error.code)) || error.source === "network") {
     return "transient";
@@ -94,7 +97,9 @@ export function useAutoResumeReport(params: {
       return;
     }
     // 失败事实进入 Host 后由看门狗去重与调度；这里只保证一次失败上报一次。
-    // v2：透传 provider 业务码 / CLI 归因，Host 侧做权威归类（1309 禁烧卡、1261 先压缩、1305 短退避）。
+    // v3：Host 另有全量 detector（task index 同步器），本上报只是可见会话的冗余通道。
+    // 必须带 errorAt：SessionPane 每次重新挂载都会重报旧错误，Host 据此丢弃陈旧重放，
+    // 已取消/已耗尽的意图不会被复活。归因、卡型与调度全在 Host。
     void usageStatsService
       .reportAutoResumeFailure({
         taskId: sessionId,
@@ -102,17 +107,22 @@ export function useAutoResumeReport(params: {
         ...(params.workspaceIdentity?.trim()
           ? { workspaceIdentity: params.workspaceIdentity }
           : {}),
-        kind,
+        errorAt: error.at,
         errorMessage: error.message,
-        nextResetTime: null,
-        failedRowTarget: null,
-        providerErrorCode: error.attribution?.providerErrorCode?.trim() || error.code || null,
+        code: error.code ?? null,
+        providerErrorCode: error.attribution?.providerErrorCode?.trim() || null,
         attributionReason: error.attribution?.reason ?? null,
+        source: error.source ?? null,
       })
       .then(() => {
         toast(
           intl.formatMessage({
-            id: kind === "quota" ? "chat.autoResume.armedQuota" : "chat.autoResume.armedTransient",
+            id:
+              kind === "quota"
+                ? "chat.autoResume.armedQuota"
+                : kind === "context"
+                  ? "chat.autoResume.armedContext"
+                  : "chat.autoResume.armedTransient",
           }),
           { variant: "info" },
         );

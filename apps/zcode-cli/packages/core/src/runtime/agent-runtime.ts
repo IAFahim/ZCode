@@ -1,3 +1,4 @@
+import type { AutoCompactPolicyConfig } from "../compact/index.js";
 import {
   createBorrowedSubagentMcpAccess,
   isBorrowedMcpPort,
@@ -618,11 +619,15 @@ export interface AgentRuntime {
   beginShutdown(): void;
   closeBrowserSession(): Promise<void>;
   closeOwnedWork(): Promise<void>;
-  updateConfig(patch: Pick<AgentRuntimeConfig, "mode" | "planEnabled" | "outputStyle">): void;
+  updateConfig(
+    patch: Pick<AgentRuntimeConfig, "mode" | "planEnabled" | "outputStyle" | "compact">,
+  ): void;
   initializeSessionShellEnvironmentIfNeeded(
     selection: ExecutionShellSelection | (() => ExecutionShellSelection),
   ): boolean;
   getSessionShellSelection(): ExecutionShellSelection | undefined;
+  /** 当前生效的自动压缩策略（分支会话继承用）。 */
+  getAutoCompactPolicy(): Pick<AutoCompactPolicyConfig, "enabled" | "usagePercentTrigger">;
   getMode(): CollaborationMode;
   getPlanEnabled(): boolean;
   grantPermissionMode(

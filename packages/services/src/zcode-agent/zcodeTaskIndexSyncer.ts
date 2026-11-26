@@ -1,4 +1,5 @@
 import { isAuxiliarySessionKind } from "@zcode/shared";
+import type { ErrorAttribution } from "@zcode/shared/zcode-protocol-v4";
 /* eslint-disable max-lines -- task index 的 v4 帧摄入、snapshot upsert 和 workspace 广播必须共享同一份闭包状态。 */
 import { repairSubagentTaskIndex } from "#src/task-facts/repairSubagentTaskIndex.js";
 import {
@@ -89,6 +90,16 @@ export interface ZCodeTaskIndexTerminalEvent {
   kind: "turn.completed" | "turn.failed";
 }
 
+/** 会话真实失败（sessions-index 观察到 running → error 的终态迁移，携带权威 lastError）。 */
+export interface ZCodeTaskIndexSessionErrorEvent {
+  target: ZCodeAgentSessionTarget;
+  /** CLI 归类码（lastError.code，缺省回退 lastError.type）。 */
+  code: string;
+  message: string;
+  detail?: string;
+  attribution?: ErrorAttribution;
+}
+
 export interface ZCodeTaskIndexReadyEvent {
   target: ZCodeAgentSessionTarget;
   /** v4 phase 终态映射：agent 收口后可接受下一条输入的 ready 边界。 */
@@ -168,6 +179,20 @@ export interface ZCodeTaskIndexSyncer {
   onSessionReadyEvent: Event<ZCodeTaskIndexReadyEvent>;
   /** 仅观察已经存在的订阅，不为自动归档创建 runtime 或第二份 phase 状态。 */
   activeTaskRefs(): Array<{ workspacePath: string; workspaceIdentity?: string; taskId: string }>;
+  /**
+   * 会话当前活跃摘要（sessions-index 最新态）；未被索引观察到的会话返回 null。
+   * sqlite 任务行不保存 running 状态（status 列只有上一次 outcome），宿主侧判断
+   * "会话是否仍在跑 / 是否在压缩" 必须读这里。
+   */
+  getSessionActivity(
+    sessionId: string,
+  ): Pick<SessionSummary, "phase" | "hasBackgroundWork" | "hasCompactWork"> | null;
+  /**
+   * 自其 workspace 的当前 runtime 代际以来观察到处于运行态的会话（候选的 live 会话）。
+   * 宿主只能向确认 live 的会话发即时配置命令：对冷会话发命令会在 CLI 侧建出空 publisher，
+   * 并把空摘要扇进 sessions-index。调用方发送前仍应逐一确认（见 autoCompactPolicySync）。
+   */
+  liveSessionRefs(): ZCodeAgentSessionTarget[];
   /** 释放所有 v4 订阅和 workspace emitter；不关闭注入的 taskIndexRepo。 */
   disposeAll(): void;
 }
@@ -176,6 +201,16 @@ interface CreateZCodeTaskIndexSyncerOptions {
   agentService: IZCodeAgentService;
   taskIndexRepo: TaskIndexRepo;
   reportActiveSessionCount?: (count: number) => void;
+  /**
+   * 会话真实失败回调（phase 终态迁移到 error，携带回源快照的权威 lastError）。
+   * 给宿主侧配额看门狗做失败检测：不依赖 renderer 是否打开该会话，后台任务同样被接管。
+   */
+  onSessionError?: (event: ZCodeTaskIndexSessionErrorEvent) => void;
+  /**
+   * 会话从空闲进入 running（新一轮开始）时回调。给宿主侧做"每轮开始前收敛会话级配置"
+   * （自动压缩策略）：此刻会话在 CLI 侧必然有 live record。
+   */
+  onSessionRunning?: (target: ZCodeAgentSessionTarget) => void;
 }
 
 /** phase 终态集合（sessions-index 的 conflated 最新态里判定迁移用）。 */
@@ -303,6 +338,11 @@ export function createZCodeTaskIndexSyncer(
   // 之前 workspaceEmitters 私有在 adapter 里，syncer 写完 sqlite 没有广播渠道，
   // UI 永远收不到 workspace_task_list_changed。把 emitter 上提到 syncer，adapter 改为转发，
   // 让 adapter 路径和 desktop-continuous 路径共用同一份订阅，事件不再分裂。
+  /** 观察到处于运行态的会话（sessionId → 所属 workspace 与当时的 runtime 代际）。 */
+  const liveSessions = new Map<
+    string,
+    { target: ZCodeAgentSessionTarget; workspaceKey: string; generation: number | null }
+  >();
   const workspaceEmitters = new Map<string, Emitter<ZCodeWorkspaceEvent>>();
   const terminalEventEmitter = new Emitter<ZCodeTaskIndexTerminalEvent>();
   const readyEventEmitter = new Emitter<ZCodeTaskIndexReadyEvent>();
@@ -491,6 +531,31 @@ export function createZCodeTaskIndexSyncer(
     });
   }
 
+  /**
+   * Bugfix：自动续跑的失败检测此前只靠 renderer 上报（SessionPane 未打开 / hidden 时任务失败无人接管）。
+   * 终态回源时把权威 lastError 交给宿主回调；辅助会话（subagent/workflow child、side chat）
+   * 由父会话承担结局，不单独续跑。回调异常不得影响索引回源。
+   */
+  function notifySessionError(
+    target: ZCodeAgentSessionTarget,
+    snapshot: ZCodeSessionStateSnapshot,
+  ) {
+    if (!options.onSessionError) return;
+    const lastError = snapshot.projection.lastError;
+    if (!lastError || isAuxiliarySessionKind(snapshot.session.sessionKind)) return;
+    try {
+      options.onSessionError({
+        target,
+        code: lastError.code ?? lastError.type,
+        message: lastError.message,
+        ...(lastError.detail ? { detail: lastError.detail } : {}),
+        ...(lastError.attribution ? { attribution: lastError.attribution } : {}),
+      });
+    } catch (error) {
+      logger.warn(undefined, `会话失败回调异常 taskId=${target.sessionId}`, error);
+    }
+  }
+
   async function resyncTaskIndexRowFromAgent(
     target: ZCodeAgentSessionTarget,
     reason: string,
@@ -512,6 +577,7 @@ export function createZCodeTaskIndexSyncer(
         runtimePolicy: "existing-only",
         contentProfile: "index",
       });
+      if (reason === "phase.error") notifySessionError(target, snapshot);
       // 回源收敛是状态/正文同步，不涉及 pin/archive/unread 归属（task_status_changed）。
       await syncSnapshotAndBroadcast(snapshot, {
         ...(options?.unreadSignal ? { unreadSignal: options.unreadSignal } : {}),
@@ -696,6 +762,24 @@ export function createZCodeTaskIndexSyncer(
     _deliveryKind: TopicDeliveryKind,
   ): void {
     state.summaries.set(next.sessionId, next);
+    if (next.phase === "running" || next.phase === "prewarming") {
+      liveSessions.set(next.sessionId, {
+        target: sessionTargetFrom(state.target, next.sessionId),
+        workspaceKey: resolveWorkspaceKey(state.target),
+        generation: state.runtimeGeneration,
+      });
+      // 空闲（终态 / 草稿 / 首次观察到）→ running：新一轮开始。
+      if (
+        next.phase === "running" &&
+        (previous === undefined || previous.phase === "draft" || isTerminalPhase(previous.phase))
+      ) {
+        try {
+          options.onSessionRunning?.(sessionTargetFrom(state.target, next.sessionId));
+        } catch (error) {
+          logger.warn(undefined, `会话开始回调异常 taskId=${next.sessionId}`, error);
+        }
+      }
+    }
     // Bug 根因：CLI 已按 persistence 过滤未提交草稿；已接受输入在初始化期间 phase
     // 仍为 draft。Host 再按执行 phase 过滤，会把新任务推迟到 Hook/TurnStarted 之后。
     const target = sessionTargetFrom(state.target, next.sessionId);
@@ -1814,6 +1898,25 @@ export function createZCodeTaskIndexSyncer(
           .map((summary) => ({ ...state.target, taskId: summary.sessionId })),
       );
     },
+    getSessionActivity(sessionId: string) {
+      for (const state of workspaceIngests.values()) {
+        const summary = state.summaries.get(sessionId);
+        if (summary) return summary;
+      }
+      return null;
+    },
+
+    liveSessionRefs() {
+      const refs: ZCodeAgentSessionTarget[] = [];
+      for (const [sessionId, live] of liveSessions) {
+        // runtime 换代（CLI 重启）后旧记录全部作废：那些会话已经冷了。
+        if (workspaceIngests.get(live.workspaceKey)?.runtimeGeneration === live.generation) {
+          refs.push({ ...live.target, sessionId });
+        }
+      }
+      return refs;
+    },
+
     ensureWorkspaceSubscription,
 
     ensureSessionSubscription(target: ZCodeAgentSessionTarget): void {

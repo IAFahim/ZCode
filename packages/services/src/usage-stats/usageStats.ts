@@ -20,23 +20,24 @@ import type {
 import { ServiceChannels } from "@zcode/shared";
 import { createServiceDescriptor } from "../descriptors.js";
 
-/** 自动续跑失败上报参数（renderer 观测到 task_error 后调用；Host 侧是意图唯一所有者）。 */
+/**
+ * 自动续跑失败上报参数（renderer 观察到 task_error 后调用；Host 侧是意图唯一所有者）。
+ * v3：renderer 只上报失败事实，归因 / 卡型 / 调度全部在 Host。宿主另有全量 detector
+ * （task index 同步器），本上报只是可见会话的冗余通道，Host 按签名与时间窗去重。
+ */
 export interface AutoResumeFailureReport {
   taskId: string;
   workspacePath: string;
   workspaceIdentity?: string;
-  kind: "quota" | "transient";
+  /** 失败发生时刻（SessionErrorInfo.at，Unix 毫秒）。必带：Host 丢弃重新挂载后的陈旧重放。 */
+  errorAt: number;
   errorMessage: string;
-  /** 上报时已知的套餐下次重置时刻（Unix 毫秒）；未知传 null，Host 侧退避兜底。 */
-  nextResetTime: number | null;
-  /** 失败 assistant 行目标（retryTurn 重放用）；无法定位时为 null，Host 走 sendText 回退。 */
-  failedRowTarget?: { rowId: number; entityId: string } | null;
-  /**
-   * v2 修订：provider 业务码 / CLI 归因原因透传，Host 侧以此做权威归因
-   * （1309 到期禁烧卡、1261 溢出走 /compact、1305 限流短退避），覆盖上报方的 kind 粗分类。
-   */
+  /** CLI 归类码（SessionErrorInfo.code）。 */
+  code?: string | null;
+  /** provider 业务码 / CLI 归因原因 / 失败来源——Host 侧权威归类的输入。 */
   providerErrorCode?: string | null;
   attributionReason?: string | null;
+  source?: string | null;
 }
 
 /** 配额守护委托面（quotaWatchdogService 结构化实现；Host 侧组装时注入）。 */

@@ -1,9 +1,12 @@
 import type { CodingPlanResetType } from "@zcode/shared";
 import {
+  RESUME_CONTEXT_COMPACT_DELAY_MS,
   RESUME_QUOTA_WAKE_MARGIN_MS,
+  RESUME_TRANSIENT_BACKOFF_MS,
   type CodingPlanResetStatusSnapshot,
   type QuotaWatchdogSettings,
   type QuotaWatchdogState,
+  type ResumeIntentKind,
 } from "@zcode/shared";
 
 // 配额守护纯领域逻辑（无 IO / 无时钟读取）：状态机迁移、轮询节奏、认领资格与
@@ -282,18 +285,27 @@ export function isOpportunityThrottleError(error: unknown): boolean {
  * 从 reset status 挑选可核销卡：优先 FIVE_HOUR（最小代价原则，WEEK 留给用户手动决策），
  * 同类多张取最早到期；全部过期返回 null。
  */
+export function hasUsableResetCard(
+  snapshot: CodingPlanResetStatusSnapshot,
+  resetType: CodingPlanResetType,
+  now: number,
+): boolean {
+  const cards =
+    resetType === "WEEK" ? snapshot.availableWeekResets : snapshot.availableFiveHourResets;
+  return cards.some((card) => card.expireAt > now);
+}
+
 export function resolveClaimTarget(
   snapshot: CodingPlanResetStatusSnapshot,
   now: number,
 ): CodingPlanResetType | null {
-  const usable = (cards: Array<{ expireAt: number }>): boolean =>
-    cards.some((card) => card.expireAt > now);
-  if (usable(snapshot.availableFiveHourResets)) return "FIVE_HOUR";
-  if (usable(snapshot.availableWeekResets)) return "WEEK";
+  if (hasUsableResetCard(snapshot, "FIVE_HOUR", now)) return "FIVE_HOUR";
+  if (hasUsableResetCard(snapshot, "WEEK", now)) return "WEEK";
   return null;
 }
 
-// ---- v2 修订（docs/quota-watchdog/spec.md §3.6）：额度口径反转 + Host 侧失败归因 ----
+// ---- 失败归因与调度纯逻辑（docs/quota-watchdog/spec.md §9）----
+// 无 IO、无时钟读取；全部可单测。service 只做编排。
 
 /**
  * entitlement 快照的 remaining.percentage 承袭 quota 接口的"已用占比"（0–100），
@@ -307,17 +319,95 @@ export function remainingPercentFromEntitlement(
     return null;
   }
   const used = Math.max(0, Math.min(100, percentage));
-  return Math.max(0, Math.min(100, 100 - used));
+  // 保留 3 位小数：避免 99.6 → 0.4000000000000057 这类浮点噪声进入日志与展示。
+  return Math.round(Math.max(0, Math.min(100, 100 - used)) * 1000) / 1000;
 }
 
-/** 套餐到期类（重置卡救不了，禁止自动核销，交还用户）。 */
-export const RESUME_PLAN_EXPIRED_CODES: ReadonlySet<string> = new Set(["1309"]);
-/** 终端额度类：用量/周期上限，必须等重置或核销卡（bigmodel-business-error-retry.md）。 */
+/** 剩余占比 ≤ 该值视为额度耗尽（服务端已用占比在耗尽时可能停在 99.x 而非 100）。 */
+export const QUOTA_EXHAUSTED_REMAINING_PERCENT = 1;
+
+/** 额度观测结果：remainingPercent 为 null 表示不可知（调用方绝不能把"不可知"当成"已耗尽"）。 */
+export interface QuotaUsageObservation {
+  remainingPercent: number | null;
+  exhausted: boolean;
+  /** 下次重置时刻（Unix 毫秒）；未知为 null。 */
+  nextResetTime: number | null;
+}
+
+function finitePositive(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/**
+ * 从 entitlement 快照求"最紧的额度桶"剩余占比。优先 quota.limits[]（逐桶取最小，
+ * 5 小时桶与周桶任何一个见底都算耗尽），回退 remaining.percentage（已用占比）。
+ */
+export function observeQuotaUsage(
+  snapshot:
+    | {
+        quota?: {
+          limits?: Array<{
+            percentage?: number;
+            remaining?: number;
+            number?: number;
+            nextResetTime?: number;
+          }>;
+        } | null;
+        remaining?: { percentage?: number; nextResetTime?: number | null } | null;
+      }
+    | null
+    | undefined,
+): QuotaUsageObservation {
+  const limits = snapshot?.quota?.limits ?? [];
+  let remainingPercent: number | null = null;
+  let nextResetTime: number | null = finitePositive(snapshot?.remaining?.nextResetTime);
+  for (const limit of limits) {
+    const reset = finitePositive(limit.nextResetTime);
+    if (reset !== null)
+      nextResetTime = nextResetTime === null ? reset : Math.min(nextResetTime, reset);
+    let bucketRemaining: number | null = null;
+    if (typeof limit.percentage === "number" && Number.isFinite(limit.percentage)) {
+      bucketRemaining = remainingPercentFromEntitlement(limit.percentage);
+    } else if (
+      typeof limit.remaining === "number" &&
+      Number.isFinite(limit.remaining) &&
+      finitePositive(limit.number) !== null
+    ) {
+      bucketRemaining = Math.max(
+        0,
+        Math.min(100, (limit.remaining / (limit.number as number)) * 100),
+      );
+    }
+    if (bucketRemaining !== null) {
+      remainingPercent =
+        remainingPercent === null ? bucketRemaining : Math.min(remainingPercent, bucketRemaining);
+    }
+  }
+  if (remainingPercent === null) {
+    remainingPercent = remainingPercentFromEntitlement(snapshot?.remaining?.percentage);
+  }
+  return {
+    remainingPercent,
+    exhausted: remainingPercent !== null && remainingPercent <= QUOTA_EXHAUSTED_REMAINING_PERCENT,
+    nextResetTime,
+  };
+}
+
+/** 重置卡救不了的额度类：1309 套餐到期、1311 套餐无模型权限、1313 fair usage restriction。 */
+export const RESUME_NO_CARD_QUOTA_CODES: ReadonlySet<string> = new Set(["1309", "1311", "1313"]);
+/** 周/月额度上限：只有 WEEK 卡能恢复；FIVE_HOUR 卡对它无效，禁止误烧。 */
+export const RESUME_WEEK_CAP_CODES: ReadonlySet<string> = new Set(["1310"]);
+/** 文档明确"重置卡可恢复"的用量上限（1308 = 使用量上限 / 5 小时窗口）。 */
+export const RESUME_FIVE_HOUR_CAP_CODES: ReadonlySet<string> = new Set(["1308"]);
+
+/** 终端额度类 provider 业务码：等重置或核销卡（docs/bigmodel-business-error-retry.md）。 */
 export const RESUME_USAGE_LIMIT_CODES: ReadonlySet<string> = new Set([
   "1005",
   "1304",
   "1308",
+  "1309",
   "1310",
+  "1311",
   "1313",
   "1316",
   "1317",
@@ -332,80 +422,207 @@ export const RESUME_USAGE_LIMIT_CODES: ReadonlySet<string> = new Set([
   "organization_usage_limit_exceeded",
   "exceeded_current_quota_error",
 ]);
-/** 限流/过载类：轮内重试预算耗尽后按短退避自动续跑（1305 = 平台流量限制）。 */
+/** 套餐到期（无任何自动动作）。 */
+export const RESUME_PLAN_EXPIRED_CODES: ReadonlySet<string> = new Set(["1309"]);
+/** 限流/过载类：轮内重试预算耗尽后按退避自动续跑（1305 = 平台流量限制或过载）。 */
 export const RESUME_RATE_LIMIT_CODES: ReadonlySet<string> = new Set([
   "429",
-  "3002",
-  "2007",
+  "1120",
+  "1230",
+  "1234",
   "1302",
   "1303",
   "1305",
   "1312",
+  "3002",
+  "2007",
   "rate_limit_reached_error",
   "rate_limit_error",
   "overloaded_error",
   "engine_overloaded_error",
 ]);
-/** 上下文溢出类（1261 等）：先 /compact 再续跑一次。 */
-export const RESUME_CONTEXT_OVERFLOW_CODES: ReadonlySet<string> = new Set(["1261"]);
+/** 上下文超窗：先 /compact 再续跑一次。 */
+export const RESUME_CONTEXT_OVERFLOW_CODES: ReadonlySet<string> = new Set([
+  "1261",
+  "model_context_exceeded",
+]);
+/** 可自动续跑的 CLI 归类码（contracts ModelErrorCode）。 */
+export const RESUME_TRANSIENT_ERROR_CODES: ReadonlySet<string> = new Set([
+  "model_rate_limited",
+  "model_request_timeout",
+  "invalid_model_response",
+]);
+/** 不可自动恢复的 CLI 归类码：重试只会重复失败，直接交还用户。 */
+export const RESUME_NON_RECOVERABLE_ERROR_CODES: ReadonlySet<string> = new Set([
+  "invalid_model_selection",
+  "model_config_missing",
+  "provider_not_found",
+  "provider_not_configured",
+  "model_not_found",
+  "invalid_model_request",
+  "model_request_auth_missing",
+  "model_request_cancelled",
+]);
 
-export type ResumeFailureClassification = "quota" | "plan_expired" | "context" | "transient";
+/** CLI attribution.reason（ModelFailureReason）。 */
+const TRANSIENT_REASONS: ReadonlySet<string> = new Set([
+  "rate_limited",
+  "provider_overloaded",
+  "server_error",
+  "network_error",
+  "timeout",
+  "stream_idle_timeout",
+  "stale_connection",
+  "auth_refresh",
+  "proxy_error",
+]);
+const NON_RECOVERABLE_REASONS: ReadonlySet<string> = new Set([
+  "auth_failed",
+  "cancelled",
+  "invalid_request",
+  "provider_not_configured",
+  "tls_error",
+]);
 
-/**
- * Host 侧权威失败归因（renderer 只上报事实，归属以此为准）。
- * 优先级：code 明示类别 > attribution.reason > source=network > 消息文本兜底。
- * 返回 null 表示无法归因，调用方按意图原 kind 兜底处理。
- */
-export function classifyTurnFailure(input: {
+export type ResumeFailureClassification =
+  | "quota"
+  | "plan_expired"
+  | "context"
+  | "transient"
+  | "non_recoverable";
+
+export interface TurnFailureInput {
+  /** CLI 归类码（ModelErrorCode）或外层错误码。 */
   code?: string | null;
+  /** provider 业务码（attribution.providerErrorCode）——额度/限流的权威判据。 */
+  providerErrorCode?: string | null;
   message?: string | null;
   attributionReason?: string | null;
+  /** attribution.source 或 SessionErrorInfo.source。 */
   source?: string | null;
-}): ResumeFailureClassification | null {
+}
+
+const CONTEXT_MESSAGE =
+  /context[ _-]?(length|window|overflow|limit|exceed)|prompt is too long|max_tokens|input length|too many tokens|compact (failed|rapid refill)|超出.{0,8}(上下文|长度)/i;
+const AUTH_MESSAGE =
+  /invalid api key|unauthori[sz]ed|authentication|\b40[13]\b|forbidden|permission denied|鉴权|认证失败/i;
+const PLAN_EXPIRED_MESSAGE =
+  /plan (has )?expired|subscription expired|coding plan .*(expired|到期)|套餐.{0,6}(到期|过期)/i;
+const QUOTA_MESSAGE =
+  /exceed (quota )?limit|quota exceeded|insufficient quota|credit balance|usage limit|balance exhausted|额度不足|用量上限|达到.{0,10}上限/i;
+const TRANSIENT_MESSAGE =
+  /rate limit|too many requests|overload|timed? ?out|timeout|network|econn(reset|refused)|socket hang up|fetch failed|service unavailable|bad gateway|gateway timeout|internal server error|\b(429|50[0234])\b|temporarily|try again|限流|频率|过载|超时|网络/i;
+
+/**
+ * 失败权威归类。优先级：provider 业务码 > CLI 归类码 > attribution.reason > source=network >
+ * 消息文本。CLI 对 1305 与 1308 发布同一套通用 reason（rate_limited 类），因此额度类与限流类
+ * 只能靠 provider 业务码区分——调用方必须尽可能透传 providerErrorCode。
+ * 返回 null = 无法归因（不建意图）；non_recoverable = 自动重试无意义。
+ */
+export function classifyTurnFailure(input: TurnFailureInput): ResumeFailureClassification | null {
+  const providerCode = input.providerErrorCode?.trim() ?? "";
+  if (providerCode) {
+    if (RESUME_PLAN_EXPIRED_CODES.has(providerCode)) return "plan_expired";
+    if (RESUME_USAGE_LIMIT_CODES.has(providerCode)) return "quota";
+    if (RESUME_CONTEXT_OVERFLOW_CODES.has(providerCode)) return "context";
+    if (RESUME_RATE_LIMIT_CODES.has(providerCode)) return "transient";
+  }
   const code = input.code?.trim() ?? "";
-  if (code) {
+  if (providerCode === "" && code) {
     if (RESUME_PLAN_EXPIRED_CODES.has(code)) return "plan_expired";
     if (RESUME_USAGE_LIMIT_CODES.has(code)) return "quota";
     if (RESUME_CONTEXT_OVERFLOW_CODES.has(code)) return "context";
     if (RESUME_RATE_LIMIT_CODES.has(code)) return "transient";
+    if (RESUME_NON_RECOVERABLE_ERROR_CODES.has(code)) return "non_recoverable";
+    if (RESUME_TRANSIENT_ERROR_CODES.has(code)) return "transient";
   }
-  if (input.attributionReason === "quota_exhausted") return "quota";
-  if (input.attributionReason === "context_exceeded") return "context";
+  const reason = input.attributionReason?.trim() ?? "";
+  if (reason) {
+    if (reason === "context_exceeded") return "context";
+    if (reason === "quota_exhausted") return "quota";
+    if (NON_RECOVERABLE_REASONS.has(reason)) return "non_recoverable";
+    if (TRANSIENT_REASONS.has(reason)) return "transient";
+  }
+  const message = input.message ?? "";
+  if (AUTH_MESSAGE.test(message)) return "non_recoverable";
+  if (CONTEXT_MESSAGE.test(message)) return "context";
+  if (PLAN_EXPIRED_MESSAGE.test(message)) return "plan_expired";
+  if (QUOTA_MESSAGE.test(message)) return "quota";
   if (input.source === "network") return "transient";
-  const message = (input.message ?? "").toLowerCase();
-  if (!message) return null;
-  if (
-    /context (length|window|overflow)|context exceeded|compact (failed|rapid refill)|token limit/.test(
-      message,
-    )
-  ) {
-    return "context";
-  }
-  if (/plan (has )?expired|subscription expired/.test(message)) return "plan_expired";
-  if (/exceed (quota )?limit|quota exceeded|insufficient quota|credit balance/.test(message)) {
-    return "quota";
-  }
-  if (
-    /rate limit|too many requests|overloaded|timeout|timed out|network|econn|fetch failed/.test(
-      message,
-    )
-  ) {
-    return "transient";
-  }
+  if (TRANSIENT_MESSAGE.test(message)) return "transient";
   return null;
 }
 
 /**
- * 失败类别 → 派发前是否允许核销重置卡：只有终端额度类（quota）允许烧卡；
- * plan_expired / context / transient 一律不烧（卡是稀缺资源，1305 等限流等 1 分钟即可恢复）。
+ * 失败 → 允许核销的卡型。只有额度类允许烧卡（卡是稀缺资源：限流等 1 分钟即恢复、
+ * 上下文溢出靠 /compact、套餐到期/fair usage 卡救不了）。
+ * - 1310 周/月上限：只认 WEEK 卡（FIVE_HOUR 卡对它无效）。
+ * - 其余额度类：FIVE_HOUR 优先（最小代价），无 5 小时卡时回退 WEEK。
  */
 export function claimTargetForFailure(
   classification: ResumeFailureClassification | null,
+  providerCode: string | null | undefined,
   snapshot: CodingPlanResetStatusSnapshot,
   now: number,
 ): CodingPlanResetType | null {
-  if (classification !== "quota" && classification !== null) {
-    return null;
+  if (classification !== "quota") return null;
+  const code = providerCode?.trim() ?? "";
+  if (code && RESUME_NO_CARD_QUOTA_CODES.has(code)) return null;
+  if (code && RESUME_WEEK_CAP_CODES.has(code)) {
+    return hasUsableResetCard(snapshot, "WEEK", now) ? "WEEK" : null;
   }
   return resolveClaimTarget(snapshot, now);
+}
+/** 同一 task 同签名的失败在该窗口内只处理一次（detector / 结局通道 / renderer 上报描述同一次失败）。 */
+export const RESUME_FAILURE_DEDUPE_WINDOW_MS = 5_000;
+/** renderer 上报的失败超过该时长视为陈旧重放（重新挂载的 SessionPane 会重报旧错误），不建意图。 */
+export const RESUME_REPORT_FRESH_WINDOW_MS = 60_000;
+/** 任务仍在活动（用户已接管 / 自发 compact 在跑）时的重排间隔；持续超过上限即取消意图。 */
+export const RESUME_ACTIVE_DEFER_MS = 60_000;
+export const RESUME_ACTIVE_DEFER_LIMIT_MS = 2 * 60 * 60_000;
+
+// ---- 调度阶梯（纯函数）----
+
+/** 派发 turn 在该时长内就以额度类失败 = 额度并未恢复（核销生效延迟 / 快照滞后）。 */
+export const RESUME_FAST_FAIL_WINDOW_MS = 20_000;
+/** 额度未恢复时的探测退避：1 → 5 → 15 → 30 分钟（封顶 30 分钟，绝不定点死等）。 */
+export const RESUME_QUOTA_PROBE_BACKOFF_MS = [
+  60_000,
+  5 * 60_000,
+  15 * 60_000,
+  30 * 60_000,
+] as const;
+/** 已知耗尽时的最长复核间隔：nextResetTime 可能数小时外，期间每 10 分钟复核一次
+ *  （卡可能出现、服务端可能提前恢复、快照可能滞后）。复核只读快照，不派发空转 turn。 */
+export const RESUME_QUOTA_MAX_RECHECK_MS = 10 * 60_000;
+/** 派发本身失败（session 未加载/命令被拒）的重试间隔；不消耗 attempt。 */
+export const RESUME_DISPATCH_RETRY_MS = 30_000;
+/** 连续派发失败上限，超过即 exhausted（session 已删除等永久性失败）。 */
+export const RESUME_MAX_DISPATCH_ERRORS = 10;
+/** 核销冷却：/use 之后 entitlement 快照可能仍是耗尽态缓存，冷却内不得据快照再次烧卡。 */
+export const RESUME_CLAIM_COOLDOWN_MS = 10 * 60_000;
+/** 核销成功后到续派发的间隔（给服务端额度生效留余量）。 */
+export const RESUME_AFTER_CLAIM_DELAY_MS = 10_000;
+/** 自发 /compact 后等待其落地的轮询间隔。 */
+export const RESUME_COMPACT_WAIT_MS = 15_000;
+
+export function quotaProbeDelayMs(fastFails: number): number {
+  const index = Math.max(
+    0,
+    Math.min(Math.floor(fastFails) - 1, RESUME_QUOTA_PROBE_BACKOFF_MS.length - 1),
+  );
+  return RESUME_QUOTA_PROBE_BACKOFF_MS[index] as number;
+}
+
+/** 瞬时类第 attempt+1 次续跑的等待：1 → 5 → 15 分钟（之后封顶 15 分钟，由 maxConsecutive 收口）。 */
+export function transientRetryDelayMs(attempt: number): number {
+  const index = Math.max(0, Math.min(Math.floor(attempt), RESUME_TRANSIENT_BACKOFF_MS.length - 1));
+  return RESUME_TRANSIENT_BACKOFF_MS[index] as number;
+}
+
+/** 已知耗尽时的下次复核时刻：min(nextReset + 裕量, now + 最长复核间隔)。 */
+export function resolveExhaustedRecheckAt(nextResetTime: number | null, now: number): number {
+  const resetAt =
+    nextResetTime === null ? Infinity : Math.max(nextResetTime, now) + RESUME_QUOTA_WAKE_MARGIN_MS;
+  return Math.min(resetAt, now + RESUME_QUOTA_MAX_RECHECK_MS);
 }

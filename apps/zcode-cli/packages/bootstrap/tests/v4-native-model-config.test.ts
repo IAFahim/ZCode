@@ -5,12 +5,18 @@
 // R-19（10 §4.2.3）追加：同值切换 → V4CommandNoopError(config.unchanged)；
 // applyRequestedSessionConfig（createSession.config 消费共用件）。
 import { describe, expect, it, vi } from "vitest";
-import { parseCommandEnvelope, type CommandEnvelope } from "@zcode/shared/zcode-protocol-v4";
+import {
+  COMMANDS_REQUIRING_BASE_REVISION,
+  parseCommandEnvelope,
+  ROW_TARGETING_COMMANDS,
+  type CommandEnvelope,
+} from "@zcode/shared/zcode-protocol-v4";
 import {
   V4CommandExecutor,
   V4SessionNotFoundError,
 } from "../src/zcode-protocol-v4/commands/executor.js";
 import { applyRequestedSessionConfig } from "../src/zcode-protocol-v4/commands/handlers/model-config.js";
+import { inheritAutoCompactPolicy } from "../src/zcode-protocol-v4/auto-compact-policy.js";
 import { V4CommandNoopError } from "../src/zcode-protocol-v4/index.js";
 import type {
   V4CommandCoreHost,
@@ -31,6 +37,7 @@ function makeApp() {
     runtime: {
       getPlanEnabled: vi.fn(() => false),
       setExecutionState: vi.fn(async () => {}),
+      updateConfig: vi.fn(),
       getSessionModelSelection: vi.fn(() => {
         calls.push("getSessionModelSelection");
         return PREVIOUS_SELECTION;
@@ -310,8 +317,143 @@ describe("v4 原生 switchCollaborationMode", () => {
   });
 });
 
+// 自动压缩策略即时应用（chat 输入区 context 面板的开关 / 阈值）：
+// 纯 runtime 配置写入，映射与 createRecord 共用 toRuntimeCompactConfig。
+describe("v4 原生 setAutoCompactPolicy", () => {
+  function autoCompactEnvelope(sessionId: string, payload: unknown): CommandEnvelope {
+    return {
+      type: "setAutoCompactPolicy",
+      payload,
+      sessionId,
+      commandId: "cmd-compact-1",
+    } as unknown as CommandEnvelope;
+  }
+
+  function setup() {
+    const app = makeApp();
+    const executor = new V4CommandExecutor(makeHost(makeRecord(app)));
+    return { app, executor };
+  }
+
+  it("开启 + 阈值：原样写进本会话 runtime 的 compact 配置", async () => {
+    const { app, executor } = setup();
+    await executor.execute(autoCompactEnvelope("s1", { enabled: true, usagePercentTrigger: 50 }));
+    expect(app.runtime.updateConfig).toHaveBeenCalledTimes(1);
+    expect(app.runtime.updateConfig).toHaveBeenCalledWith({
+      compact: { enabled: true, usagePercentTrigger: 50 },
+    });
+    // 纯配置写入：不切模型、不切模式、不发任何投影事件。
+    expect(app.setModel).not.toHaveBeenCalled();
+    expect(app.setMode).not.toHaveBeenCalled();
+    expect(app.runtime.emitModelSelected).not.toHaveBeenCalled();
+    expect(app.runtime.emitModeChanged).not.toHaveBeenCalled();
+  });
+
+  it("关闭：只写 enabled=false，阈值一并丢弃", async () => {
+    const { app, executor } = setup();
+    await executor.execute(autoCompactEnvelope("s1", { enabled: false, usagePercentTrigger: 50 }));
+    expect(app.runtime.updateConfig).toHaveBeenCalledWith({ compact: { enabled: false } });
+  });
+
+  it("阈值 100 / 缺省 = 统一算法：不写 usagePercentTrigger", async () => {
+    const { app, executor } = setup();
+    await executor.execute(autoCompactEnvelope("s1", { enabled: true, usagePercentTrigger: 100 }));
+    expect(app.runtime.updateConfig).toHaveBeenLastCalledWith({ compact: { enabled: true } });
+    await executor.execute(autoCompactEnvelope("s1", { enabled: true }));
+    expect(app.runtime.updateConfig).toHaveBeenLastCalledWith({ compact: { enabled: true } });
+  });
+
+  it("同值重复下发按 accepted 处理（不抛 noop）：Host 重启后首次下发必然同值", async () => {
+    const { app, executor } = setup();
+    await executor.execute(autoCompactEnvelope("s1", { enabled: true, usagePercentTrigger: 30 }));
+    await expect(
+      executor.execute(autoCompactEnvelope("s1", { enabled: true, usagePercentTrigger: 30 })),
+    ).resolves.toBeUndefined();
+    expect(app.runtime.updateConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it("非法载荷在协议边界被拒：阈值越界 / 非整数 / 缺 enabled / 未知字段", () => {
+    const base = {
+      type: "setAutoCompactPolicy",
+      sessionId: "s1",
+      commandId: "cmd-compact-validate",
+      clientId: "test",
+      issuedAt: Date.now(),
+    };
+    for (const payload of [
+      { enabled: true, usagePercentTrigger: 0 },
+      { enabled: true, usagePercentTrigger: 101 },
+      { enabled: true, usagePercentTrigger: 50.5 },
+      { enabled: true, usagePercentTrigger: "50" },
+      { enabled: "true" },
+      { usagePercentTrigger: 50 },
+      { enabled: true, usagePercentTrigger: 50, thresholdPercent: 50 },
+    ]) {
+      expect(parseCommandEnvelope({ ...base, payload }).ok).toBe(false);
+    }
+    for (const payload of [
+      { enabled: true, usagePercentTrigger: 1 },
+      { enabled: true, usagePercentTrigger: 100 },
+      { enabled: false },
+    ]) {
+      expect(parseCommandEnvelope({ ...base, payload }).ok).toBe(true);
+    }
+  });
+
+  it("session 不存在：拒绝且不写配置", async () => {
+    const { app, executor } = setup();
+    await expect(
+      executor.execute(autoCompactEnvelope("missing", { enabled: true, usagePercentTrigger: 50 })),
+    ).rejects.toThrow(V4SessionNotFoundError);
+    expect(app.runtime.updateConfig).not.toHaveBeenCalled();
+  });
+
+  it("非 CAS、非行定位：运行中不带 baseRevision 也立即执行", () => {
+    const { executor } = setup();
+    expect(executor.supports("setAutoCompactPolicy")).toBe(true);
+    expect(COMMANDS_REQUIRING_BASE_REVISION.has("setAutoCompactPolicy")).toBe(false);
+    expect(ROW_TARGETING_COMMANDS.has("setAutoCompactPolicy")).toBe(false);
+  });
+});
+
 // R-19：createSession.config 消费共用件——请求 config 覆盖 runtime 缺省，
 // 只对差异部分生效并补发与 switch 命令同源的事件（日志自足）。
+// 分支继承（fork / inherit）：父会话当前生效的策略 → 分支的 session 启动偏好。
+// 回归背景：分支曾硬编码"开启 + 统一算法"，用户关掉自动压缩或调低阈值后 fork 出来的会话无视该设置；
+// 首版修复又直接调用 runtime.getAutoCompactPolicy()，父 runtime 没有该方法时 fork 整体抛 TypeError。
+describe("inheritAutoCompactPolicy（分支继承父会话的自动压缩策略）", () => {
+  it("继承父会话当前生效的开关与阈值（含运行中经命令收到的更新）", () => {
+    expect(
+      inheritAutoCompactPolicy({
+        getAutoCompactPolicy: () => ({ enabled: false, usagePercentTrigger: 30 }),
+      }),
+    ).toEqual({ enabled: false, thresholdPercent: 30 });
+    expect(inheritAutoCompactPolicy({ getAutoCompactPolicy: () => ({ enabled: true }) })).toEqual({
+      enabled: true,
+      thresholdPercent: 100,
+    });
+  });
+
+  it("父 runtime 不支持该查询（旧 core / 测试替身）：回落默认，fork 不失败", () => {
+    const fallback = { enabled: true, thresholdPercent: 100 };
+    expect(inheritAutoCompactPolicy({} as never)).toEqual(fallback);
+    expect(inheritAutoCompactPolicy({ getAutoCompactPolicy: undefined } as never)).toEqual(
+      fallback,
+    );
+    expect(inheritAutoCompactPolicy(undefined as never)).toEqual(fallback);
+  });
+
+  it("父会话的非法阈值按未设置收口", () => {
+    for (const invalid of [0, 100, 150, 50.5, Number.NaN]) {
+      expect(
+        inheritAutoCompactPolicy({
+          getAutoCompactPolicy: () => ({ enabled: true, usagePercentTrigger: invalid }),
+        }),
+      ).toEqual({ enabled: true, thresholdPercent: 100 });
+    }
+  });
+});
+
 describe("切模型前校验当前 Environment Provider", () => {
   function makeResolvingHost(
     record: V4SessionRecordView,

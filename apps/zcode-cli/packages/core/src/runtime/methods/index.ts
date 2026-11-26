@@ -2,6 +2,7 @@ import type { AgentRuntimeInternal } from "../internal.js";
 import { sampleModel } from "./sample-model.js";
 import { grantPermissionMode } from "../permission-full-access.js";
 import {
+  getAutoCompactPolicy,
   getSessionShellSelection,
   initializeSessionShellEnvironmentIfNeeded,
   updateConfig,
@@ -217,6 +218,7 @@ export function installAgentRuntimeMethods(ctor: AgentRuntimeConstructor): void 
   proto.setExecutionState = setExecutionState;
   proto.grantPermissionMode = grantPermissionMode;
   proto.initializeSessionShellEnvironmentIfNeeded = initializeSessionShellEnvironmentIfNeeded;
+  proto.getAutoCompactPolicy = getAutoCompactPolicy;
   proto.getSessionShellSelection = getSessionShellSelection;
   proto.getMode = getMode;
   proto.getPlanEnabled = getPlanEnabled;

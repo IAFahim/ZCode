@@ -7458,8 +7458,9 @@ const zhCN: Record<string, string> = {
 
   // Start Plan 单桶额度提醒
   // 配额守护自动续跑（docs/quota-watchdog/spec.md）
-  "chat.autoResume.armedQuota": "任务失败——额度重置后将自动继续执行。",
+  "chat.autoResume.armedQuota": "任务失败——将自动使用重置卡（如有）或等待额度重置后继续执行。",
   "chat.autoResume.armedTransient": "任务失败——稍后将自动重试。",
+  "chat.autoResume.armedContext": "任务失败——上下文已满，将自动压缩后继续执行。",
   "chat.quota.startPlan.bucketDailyLow": "{model} 今日额度剩余 {percent}（{remaining} tokens）。",
   "chat.quota.startPlan.bucketActivityLow":
     "{model} 活动额度剩余 {percent}（{remaining} tokens）。",
