@@ -6,8 +6,8 @@ import type { CommandAck } from "@zcode/shared/zcode-protocol-v4";
 //    inbox 去重（command-inbox decide → remember:false），同一 commandId 原样重发即可；v3 却把它当成
 //    派发失败丢进 30s 重试阶梯——重启后每个后台任务的首次续跑都白等半分钟，还消耗派发失败计数。
 // 2. 桌面 composer / 手机 / Bot 直接走 sendConversationCommandV4，不经 zcodeTaskService.sendPrompt，
-//    其 onManualPromptSubmitted 只覆盖 cron / 闲时派发。用户手动发消息后旧意图仍是 pending：
-//    用户那一轮结束后 watchdog 又注入一条续跑（spec §3.4「新消息即取消」落空）。
+//    其 onManualPromptSubmitted 只覆盖 cron / 闲时派发。用户自己发消息 / 编辑重发 / 点重试之后旧意图
+//    仍是 pending：用户那一轮结束后 watchdog 又注入一条续跑（spec §3.4「新消息即取消」落空）。
 
 /** 守卫拒绝码：目标会话的 runtime 尚未 ready（bootstrap v4-gateway guard）。 */
 export const RUNTIME_INITIALIZING_REASON = "guard.runtimeInitializing";
@@ -22,16 +22,31 @@ export interface CommandEnvelopeLike {
   payload?: unknown;
 }
 
+/** 用户主动开启 / 改投一轮的 v4 命令。 */
+const USER_TURN_COMMAND_TYPES: ReadonlySet<string> = new Set([
+  "sendText",
+  "editUserQuery",
+  "retryTurn",
+  "sendQueuedNow",
+]);
+
 /**
- * 用户手动输入 = 带会话的 sendText 且无后台归因。归因字段与 v4 sendText payload 的
+ * 用户接管 = 带会话的「开启 / 改投一轮」命令且无后台归因。归因字段与 v4 sendText payload 的
  * automationId / offPeakTaskId / resumeIntentId（互斥）一致：续跑自身、定时任务、闲时任务都不算接管。
+ * 四种命令都只由 UI / 客户端发出：composer 发送、编辑重发、手动重试、立即发送排队项
+ * （后三种同样绕过 sendPrompt，是 spec §3.4 一直"暂缓"的 renderer editUserQuery 一类）。
  */
-export function isManualTextInput(envelope: CommandEnvelopeLike): boolean {
-  if (envelope.type !== "sendText" || !envelope.sessionId) return false;
+export function isUserTakeoverCommand(envelope: CommandEnvelopeLike): boolean {
+  if (!envelope.sessionId || !USER_TURN_COMMAND_TYPES.has(envelope.type)) return false;
   const { payload } = envelope;
   if (!payload || typeof payload !== "object") return false;
   const { automationId, offPeakTaskId, resumeIntentId } = payload as Record<string, unknown>;
   return !automationId && !offPeakTaskId && !resumeIntentId;
+}
+
+/** 编辑重发被拦下（文件冲突，composer 保留编辑态）：命令被接纳但没有开新一轮，不算接管。 */
+function isBlockedEdit(ack: Pick<CommandAck, "result">): boolean {
+  return ack.result?.type === "editUserQuery" && ack.result.disposition === "blocked";
 }
 
 /** 网关守卫以「runtime 未就绪」拒绝：不是命令本身有问题，稍后原样重发即可。 */
@@ -74,20 +89,24 @@ export async function sendAfterRuntimeReady<T extends CommandAck>(
 }
 
 /**
- * 包一层 v4 命令入口：被接纳的用户手动输入即用户接管，取消该会话在途的自动续跑意图。
+ * 包一层 v4 命令入口：被接纳的用户接管命令即取消该会话在途的自动续跑意图。
  * 只在 ack 为 accepted 后触发——被拒绝 / 过期的输入没有开新一轮，续跑仍应照常进行。
  * 取消失败不改变命令裁决（cancel 自身吞掉仓库错误；这里的 catch 只兜底意外的同步异常）。
  */
-export function withManualInputCancel<
+export function withUserTakeoverCancel<
   P extends { envelope: CommandEnvelopeLike },
-  T extends Pick<CommandAck, "status">,
+  T extends Pick<CommandAck, "status" | "result">,
 >(
   send: (params: P) => Promise<T>,
   cancel: (sessionId: string) => Promise<void>,
 ): (params: P) => Promise<T> {
   return async (params) => {
     const ack = await send(params);
-    if (ack.status === "accepted" && isManualTextInput(params.envelope)) {
+    if (
+      ack.status === "accepted" &&
+      !isBlockedEdit(ack) &&
+      isUserTakeoverCommand(params.envelope)
+    ) {
       const sessionId = params.envelope.sessionId;
       if (sessionId) await cancel(sessionId).catch(() => undefined);
     }

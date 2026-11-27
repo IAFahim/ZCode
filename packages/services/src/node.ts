@@ -450,10 +450,10 @@ export {
   type TaskActivity,
 } from "./usage-stats/quotaResumeTracker.js";
 export {
-  isManualTextInput,
+  isUserTakeoverCommand,
   isRuntimeInitializingRejection,
   sendAfterRuntimeReady,
-  withManualInputCancel,
+  withUserTakeoverCancel,
   RESUME_RUNTIME_READY_MAX_RETRIES,
   RESUME_RUNTIME_READY_RETRY_DELAY_MS,
   RUNTIME_INITIALIZING_REASON,
@@ -658,7 +658,7 @@ import {
 import { isOutcomeForInput, type QuotaResumeTarget } from "./usage-stats/quotaResumeTracker.js";
 import {
   sendAfterRuntimeReady,
-  withManualInputCancel,
+  withUserTakeoverCancel,
 } from "./usage-stats/quotaResumeCommandGuard.js";
 import { ResumeIntentRepo } from "./session/resumeIntentRepo.js";
 import { createAutoCompactPolicySync } from "./session/autoCompactPolicySync.js";
@@ -3441,11 +3441,12 @@ export function createLocalServices(options: {
         });
         // 用户手动输入 → 取消在途自动续跑意图（后接线，见上方 ref 声明处注释）。
         quotaWatchdogUserCancelRef.current = quotaWatchdog.cancelAutoResume.bind(quotaWatchdog);
-        // 同一规则的 v4 命令总入口（withManualInputCancel）：桌面 composer、手机/远端、Bot 的输入都直接走
+        // 同一规则的 v4 命令总入口（withUserTakeoverCancel）：桌面 composer、手机/远端、Bot 的输入都直接走
         // sendConversationCommandV4，不经过 zcodeTaskService.sendPrompt。实机（v4.0.0-watchdog.3 首启）：
         // 用户在会话里手动发消息后，该会话的旧意图仍是 pending、从未取消，只靠"任务在活动"推迟。
+        // 覆盖四种由用户开启 / 改投一轮的命令：发送、编辑重发、手动重试、立即发送排队项。
         // 最后装入、包在最外层：worktree 守卫与连接作用域照常在其内层生效；各调用方都按属性名动态取方法。
-        zcodeAgentService.sendConversationCommandV4 = withManualInputCancel(
+        zcodeAgentService.sendConversationCommandV4 = withUserTakeoverCancel(
           zcodeAgentService.sendConversationCommandV4.bind(zcodeAgentService),
           (taskId) => quotaWatchdog.cancelAutoResume({ taskId, reason: "user_manual_input" }),
         );

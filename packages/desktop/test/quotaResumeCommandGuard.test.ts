@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  isManualTextInput,
+  isUserTakeoverCommand,
   isRuntimeInitializingRejection,
   QuotaWatchdogService,
   RESUME_AFTER_CLAIM_DELAY_MS,
@@ -13,7 +13,7 @@ import {
   RESUME_RUNTIME_READY_RETRY_DELAY_MS,
   RUNTIME_INITIALIZING_REASON,
   sendAfterRuntimeReady,
-  withManualInputCancel,
+  withUserTakeoverCancel,
   type CommandEnvelopeLike,
   type QuotaResumeDispatchPort,
   type TurnOutcomeWaitResult,
@@ -24,7 +24,8 @@ import type { CommandAck } from "@zcode/shared/zcode-protocol-v4";
 // 1. 冷会话 runtime 仍在初始化 → 网关守卫拒绝（guard.runtimeInitializing）。守卫拒绝不记入 inbox
 //    去重，同一 commandId 原样重发即可；v3 却当成派发失败丢进 30s 阶梯，重启后每个后台任务白等半分钟。
 // 2. 桌面 composer / 手机 / Bot 直接走 sendConversationCommandV4，不经 sendPrompt 的
-//    onManualPromptSubmitted：用户手动发消息后旧意图仍是 pending，用户那一轮结束后又被注入续跑。
+//    onManualPromptSubmitted：用户自己发消息 / 编辑重发 / 点重试后旧意图仍是 pending，
+//    用户那一轮结束后又被注入续跑。
 
 const T0 = 1_700_000_000_000;
 const WS = "/tmp/workspace";
@@ -39,14 +40,14 @@ const rejectedWhileInitializing = (): CommandAck =>
 
 const accepted = (): CommandAck => ({ commandId: "cmd", status: "accepted" }) as CommandAck;
 
-describe("isManualTextInput", () => {
-  it("带会话、无后台归因的 sendText 是用户手动输入", () => {
+describe("isUserTakeoverCommand", () => {
+  it("带会话、无后台归因的 sendText 是用户接管", () => {
     expect(
-      isManualTextInput({ type: "sendText", sessionId: "sess_1", payload: { text: "hi" } }),
+      isUserTakeoverCommand({ type: "sendText", sessionId: "sess_1", payload: { text: "hi" } }),
     ).toBe(true);
     // payload 里还有别的字段（heldQueueDisposition / attachments / modelSelection …）不影响判定。
     expect(
-      isManualTextInput({
+      isUserTakeoverCommand({
         type: "sendText",
         sessionId: "sess_1",
         payload: { text: "hi", heldQueueDisposition: "keepQueueAndSend", clientId: "c" },
@@ -61,7 +62,7 @@ describe("isManualTextInput", () => {
       { offPeakTaskId: "o_1" },
     ]) {
       expect(
-        isManualTextInput({
+        isUserTakeoverCommand({
           type: "sendText",
           sessionId: "sess_1",
           payload: { text: "continue", ...attribution },
@@ -70,15 +71,39 @@ describe("isManualTextInput", () => {
     }
   });
 
-  it("非 sendText、无会话、无 payload 都不算", () => {
-    expect(isManualTextInput({ type: "compact", sessionId: "sess_1", payload: {} })).toBe(false);
-    expect(isManualTextInput({ type: "interrupt", sessionId: "sess_1", payload: {} })).toBe(false);
-    expect(isManualTextInput({ type: "sendText", sessionId: null, payload: { text: "hi" } })).toBe(
+  it("编辑重发 / 手动重试 / 立即发送排队项同样是用户接管（都只由 UI / 客户端发出，不带归因）", () => {
+    for (const type of ["editUserQuery", "retryTurn", "sendQueuedNow"]) {
+      expect(
+        isUserTakeoverCommand({
+          type,
+          sessionId: "sess_1",
+          payload: { target: { rowId: "row_1" } },
+        }),
+      ).toBe(true);
+      // 带后台归因的同类命令（今后若有）不算接管。
+      expect(
+        isUserTakeoverCommand({
+          type,
+          sessionId: "sess_1",
+          payload: { target: { rowId: "row_1" }, resumeIntentId: "ri_1" },
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("其它命令、无会话、无 payload 都不算", () => {
+    for (const type of ["compact", "interrupt", "forkAssistant", "applyFileRewind"]) {
+      expect(isUserTakeoverCommand({ type, sessionId: "sess_1", payload: {} })).toBe(false);
+    }
+    expect(
+      isUserTakeoverCommand({ type: "sendText", sessionId: null, payload: { text: "hi" } }),
+    ).toBe(false);
+    expect(isUserTakeoverCommand({ type: "sendText", payload: { text: "hi" } })).toBe(false);
+    expect(isUserTakeoverCommand({ type: "sendText", sessionId: "sess_1" })).toBe(false);
+    expect(isUserTakeoverCommand({ type: "sendText", sessionId: "sess_1", payload: "hi" })).toBe(
       false,
     );
-    expect(isManualTextInput({ type: "sendText", payload: { text: "hi" } })).toBe(false);
-    expect(isManualTextInput({ type: "sendText", sessionId: "sess_1" })).toBe(false);
-    expect(isManualTextInput({ type: "sendText", sessionId: "sess_1", payload: "hi" })).toBe(false);
+    expect(isUserTakeoverCommand({ type: "retryTurn", sessionId: "sess_1" })).toBe(false);
   });
 });
 
@@ -174,16 +199,16 @@ describe("sendAfterRuntimeReady", () => {
   });
 });
 
-describe("withManualInputCancel", () => {
+describe("withUserTakeoverCancel", () => {
   interface Params {
     workspacePath: string;
     envelope: CommandEnvelopeLike;
   }
 
-  it("被接纳的手动输入 → 取消该会话的在途续跑", async () => {
+  it("被接纳的用户接管 → 取消该会话的在途续跑", async () => {
     const send = vi.fn(async (_params: Params) => accepted());
     const cancel = vi.fn(async (_sessionId: string) => {});
-    const wrapped = withManualInputCancel<Params, CommandAck>(send, cancel);
+    const wrapped = withUserTakeoverCancel<Params, CommandAck>(send, cancel);
 
     const params: Params = {
       workspacePath: WS,
@@ -191,13 +216,53 @@ describe("withManualInputCancel", () => {
     };
     await expect(wrapped(params)).resolves.toEqual(accepted());
     expect(send).toHaveBeenCalledWith(params);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledWith("sess_1");
+
+    // 用户自己点了重试：同样是接管。
+    await wrapped({
+      workspacePath: WS,
+      envelope: { type: "retryTurn", sessionId: "sess_2", payload: { target: { rowId: "row_1" } } },
+    });
+    expect(cancel).toHaveBeenCalledTimes(2);
+    expect(cancel).toHaveBeenLastCalledWith("sess_2");
+  });
+
+  it("编辑重发被拦下（disposition=blocked）：命令被接纳但没有开新一轮，不取消", async () => {
+    const cancel = vi.fn(async (_sessionId: string) => {});
+    const editParams: Params = {
+      workspacePath: WS,
+      envelope: {
+        type: "editUserQuery",
+        sessionId: "sess_1",
+        payload: { target: { rowId: "row_1" }, newText: "edited" },
+      },
+    };
+    const blocked = {
+      commandId: "cmd",
+      status: "accepted",
+      result: { type: "editUserQuery", disposition: "blocked", sessionId: "sess_1" },
+    } as CommandAck;
+    const blockedSend = withUserTakeoverCancel<Params, CommandAck>(async () => blocked, cancel);
+    await expect(blockedSend(editParams)).resolves.toBe(blocked);
+    expect(cancel).not.toHaveBeenCalled();
+
+    // 真正改投成功（rewind）才算接管。
+    const rewound = {
+      commandId: "cmd",
+      status: "accepted",
+      result: { type: "editUserQuery", disposition: "rewind", sessionId: "sess_1" },
+    } as CommandAck;
+    const rewindSend = withUserTakeoverCancel<Params, CommandAck>(async () => rewound, cancel);
+    await rewindSend(editParams);
+    expect(cancel).toHaveBeenCalledTimes(1);
     expect(cancel).toHaveBeenCalledWith("sess_1");
   });
 
   it("自动续跑自己的 sendText 不会把别的意图取消掉", async () => {
     const send = vi.fn(async (_params: Params) => accepted());
     const cancel = vi.fn(async (_sessionId: string) => {});
-    const wrapped = withManualInputCancel<Params, CommandAck>(send, cancel);
+    const wrapped = withUserTakeoverCancel<Params, CommandAck>(send, cancel);
 
     await wrapped({
       workspacePath: WS,
@@ -215,15 +280,16 @@ describe("withManualInputCancel", () => {
     expect(cancel).not.toHaveBeenCalled();
   });
 
-  it("被拒绝 / 过期的手动输入没有开新一轮：不取消", async () => {
+  it("被拒绝 / 过期的接管命令没有开新一轮：不取消", async () => {
     for (const ack of [
       { status: "rejected" },
       { status: "stale" },
       { status: "failed" },
+      { status: "duplicate" },
     ] as CommandAck[]) {
       const send = vi.fn(async (_params: Params) => ack);
       const cancel = vi.fn(async (_sessionId: string) => {});
-      const wrapped = withManualInputCancel<Params, CommandAck>(send, cancel);
+      const wrapped = withUserTakeoverCancel<Params, CommandAck>(send, cancel);
       await expect(
         wrapped({
           workspacePath: WS,
@@ -236,7 +302,7 @@ describe("withManualInputCancel", () => {
 
   it("取消出错不改变命令裁决；下游抛错原样上抛", async () => {
     const ack = accepted();
-    const failingCancel = withManualInputCancel<Params, CommandAck>(
+    const failingCancel = withUserTakeoverCancel<Params, CommandAck>(
       async () => ack,
       async () => {
         throw new Error("repo locked");
@@ -252,7 +318,7 @@ describe("withManualInputCancel", () => {
     const send = vi.fn(async () => {
       throw new Error("agent offline");
     });
-    const wrapped = withManualInputCancel<Params, CommandAck>(send, async () => {});
+    const wrapped = withUserTakeoverCancel<Params, CommandAck>(send, async () => {});
     await expect(
       wrapped({
         workspacePath: WS,
@@ -362,9 +428,9 @@ describe("自动续跑 × runtime 初始化（真实 QuotaWatchdogService + 真�
       }),
       now: () => now,
     });
-    // 与 node.ts 相同的装配：v4 命令总入口包一层"手动输入即取消"。
+    // 与 node.ts 相同的装配：v4 命令总入口包一层"用户接管即取消"。
     const sendConversationCommandV4 = options.wrapCommandEntry
-      ? withManualInputCancel<{ envelope: CommandEnvelopeLike }, CommandAck>(
+      ? withUserTakeoverCancel<{ envelope: CommandEnvelopeLike }, CommandAck>(
           () => runtime.sendConversationCommandV4(),
           (taskId) => service.cancelAutoResume({ taskId, reason: "user_manual_input" }),
         )
@@ -395,6 +461,9 @@ describe("自动续跑 × runtime 初始化（真实 QuotaWatchdogService + 真�
       sendConversationCommandV4,
       now: () => now,
       failAndDispatch,
+      advance: (ms: number) => {
+        now += ms;
+      },
     };
   }
 
@@ -514,5 +583,35 @@ describe("自动续跑 × runtime 初始化（真实 QuotaWatchdogService + 真�
       envelope: { type: "sendText", sessionId: "t_other", payload: { text: "hi" } },
     });
     expect(await h.repo.getActiveByTask("t1")).toMatchObject({ status: "pending" });
+  });
+
+  it("用户自己点了重试（retryTurn）并被接纳 → pending 意图取消；重试再失败则由 detector 重新建意图", async () => {
+    const h = await createHarness({ wrapCommandEntry: true });
+    await h.service.handleSessionFailure({
+      taskId: "t1",
+      workspacePath: WS,
+      providerErrorCode: "1308",
+      message: "usage limit reached",
+      via: "detector",
+    });
+    expect(await h.repo.getActiveByTask("t1")).toMatchObject({ status: "pending" });
+
+    const ack = await h.sendConversationCommandV4!({
+      envelope: { type: "retryTurn", sessionId: "t1", payload: { target: { rowId: "row_1" } } },
+    });
+    expect(ack.status).toBe("accepted");
+    expect(await h.repo.getActiveByTask("t1")).toBeNull();
+
+    // 取消只作废那一条旧意图：用户的手动重试再次以 1308 失败，自动续跑照常重新接管
+    // （同签名失败只在 5 秒内去重，为的是合并 detector 与结局通道的同一次上报；人工重试总在其后）。
+    h.advance(6_000);
+    await h.service.handleSessionFailure({
+      taskId: "t1",
+      workspacePath: WS,
+      providerErrorCode: "1308",
+      message: "usage limit reached",
+      via: "detector",
+    });
+    expect(await h.repo.getActiveByTask("t1")).toMatchObject({ status: "pending", attempt: 0 });
   });
 });

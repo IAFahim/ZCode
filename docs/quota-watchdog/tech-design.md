@@ -437,15 +437,15 @@ interface QuotaResumeDispatchPort {
 | --- | --- |
 | `isRuntimeInitializingRejection(ack)` | `rejected` + `guard.runtimeInitializing` |
 | `sendAfterRuntimeReady(send, { retryDelayMs, maxRetries, sleep? })` | 只对该拒绝码按 1s × 30 次原样重发，返回最后一次 ack；其它 ack 与抛错不重试 |
-| `isManualTextInput(envelope)` | 带会话的 `sendText` 且无 `automationId` / `offPeakTaskId` / `resumeIntentId` |
-| `withManualInputCancel(send, cancel)` | ack 为 `accepted` 的手动输入 → `cancel(sessionId)`；取消失败不改变命令裁决 |
+| `isUserTakeoverCommand(envelope)` | 带会话的 `sendText` / `editUserQuery` / `retryTurn` / `sendQueuedNow` 且无 `automationId` / `offPeakTaskId` / `resumeIntentId`（四种命令都只由 UI / 客户端发出） |
+| `withUserTakeoverCancel(send, cancel)` | ack 为 `accepted` 的用户接管命令 → `cancel(sessionId)`；编辑重发被拦下（`result.disposition = "blocked"`）不算；取消失败不改变命令裁决 |
 
 **装配（`node.ts`）**：
 
 - resume port 的 `sendResumeText` / `requestCompact`：`sendConversationCommandV4` 调用包
   `sendAfterRuntimeReady`。重发发生在 `ensureSessionReady` 之后，会话已激活，不会对冷会话建出空
   publisher；守卫拒绝是 `remember:false`，同一 `commandId` 重发不会被 inbox 去重吞掉。
-- 看门狗构造之后：`zcodeAgentService.sendConversationCommandV4 = withManualInputCancel(<原方法>.bind(service),
+- 看门狗构造之后：`zcodeAgentService.sendConversationCommandV4 = withUserTakeoverCancel(<原方法>.bind(service),
   (taskId) => quotaWatchdog.cancelAutoResume({ taskId, reason: "user_manual_input" }))`。最后装入、
   包在最外层：工厂内的 worktree 删除守卫（`runSessionOperation`）在其内层；连接作用域
   （`base.sendConversationCommandV4(…)`）、task adapter、app-control、Bot、task index syncer 都按
@@ -457,4 +457,5 @@ interface QuotaResumeDispatchPort {
 
 **已证伪假设（v3.1）**：`ensureSessionReady` 返回即代表 v4 发布链 ready（不代表，冷会话紧随其后
 的命令会被守卫拒绝）；用户手动输入都经过 `zcodeTaskService.sendPrompt`（桌面 composer、手机 / 远端、
-Bot 直接走 `sendConversationCommandV4`）。
+Bot 直接走 `sendConversationCommandV4`）；被接纳的命令一定开了新一轮（`editUserQuery` 可以
+`accepted` 且 `disposition = "blocked"`，不算接管）。
