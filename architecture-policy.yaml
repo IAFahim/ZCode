@@ -2492,6 +2492,7 @@ exceptions:
       - packages/services/src/usage-stats/quotaResumeGate.ts
       - packages/services/src/usage-stats/quotaResumeTracker.ts
       - packages/services/src/usage-stats/quotaResumeSettlement.ts
+      - packages/services/src/usage-stats/quotaResumeCommandGuard.ts
       - packages/services/src/session/autoCompactPolicySync.ts
       - apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/auto-compact-policy.ts
       - packages/ui/src/settings/AutoResumeSettingsCard.tsx

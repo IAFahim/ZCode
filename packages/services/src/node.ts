@@ -413,6 +413,7 @@ export {
   RESUME_AFTER_CLAIM_DELAY_MS,
   RESUME_CLAIM_COOLDOWN_MS,
   RESUME_COMPACT_WAIT_MS,
+  RESUME_DISPATCH_RETRY_MS,
   RESUME_FAST_FAIL_WINDOW_MS,
   RESUME_MAX_DISPATCH_ERRORS,
   RESUME_QUOTA_MAX_RECHECK_MS,
@@ -448,6 +449,17 @@ export {
   type ResumeTaskBookkeeping,
   type TaskActivity,
 } from "./usage-stats/quotaResumeTracker.js";
+export {
+  isManualTextInput,
+  isRuntimeInitializingRejection,
+  sendAfterRuntimeReady,
+  withManualInputCancel,
+  RESUME_RUNTIME_READY_MAX_RETRIES,
+  RESUME_RUNTIME_READY_RETRY_DELAY_MS,
+  RUNTIME_INITIALIZING_REASON,
+  type CommandEnvelopeLike,
+  type RuntimeReadyRetryDeps,
+} from "./usage-stats/quotaResumeCommandGuard.js";
 export {
   createAutoCompactPolicySync,
   isLiveLifecycleState,
@@ -644,6 +656,10 @@ import {
   type TurnOutcomeWaitResult,
 } from "./usage-stats/quotaWatchdogService.js";
 import { isOutcomeForInput, type QuotaResumeTarget } from "./usage-stats/quotaResumeTracker.js";
+import {
+  sendAfterRuntimeReady,
+  withManualInputCancel,
+} from "./usage-stats/quotaResumeCommandGuard.js";
 import { ResumeIntentRepo } from "./session/resumeIntentRepo.js";
 import { createAutoCompactPolicySync } from "./session/autoCompactPolicySync.js";
 import { createHostCommandEnvelope } from "./zcode-agent/zcodeV4HostCommand.js";
@@ -3292,21 +3308,27 @@ export function createLocalServices(options: {
             ensureTaskIndexed(target);
             await zcodeAgentService.ensureSessionReady(sessionTargetOf(target));
             // 与 zcodeTaskService.sendPrompt 的 v4 主路径同形：commandId 即本轮 inputId。
-            const ack = await zcodeAgentService.sendConversationCommandV4({
-              workspacePath: target.workspacePath,
-              ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
-              clientMode: "desktop-continuous",
-              envelope: createHostCommandEnvelope({
-                type: "sendText",
-                payload: {
-                  text: RESUME_PROMPT_TEXT,
-                  heldQueueDisposition: "keepQueueAndSend",
-                  resumeIntentId,
-                },
-                sessionId: target.taskId,
-                commandId: inputId,
+            // 冷会话：ensureSessionReady 只保证 runtime 已激活，v4 发布链未必 ready，紧随其后的命令会被
+            // 守卫以 guard.runtimeInitializing 拒绝（不记入去重）——原地等待重发，不占用意图的派发重试。
+            const ack = await sendAfterRuntimeReady(() =>
+              zcodeAgentService.sendConversationCommandV4({
+                workspacePath: target.workspacePath,
+                ...(target.workspaceIdentity
+                  ? { workspaceIdentity: target.workspaceIdentity }
+                  : {}),
+                clientMode: "desktop-continuous",
+                envelope: createHostCommandEnvelope({
+                  type: "sendText",
+                  payload: {
+                    text: RESUME_PROMPT_TEXT,
+                    heldQueueDisposition: "keepQueueAndSend",
+                    resumeIntentId,
+                  },
+                  sessionId: target.taskId,
+                  commandId: inputId,
+                }),
               }),
-            });
+            );
             if (ack.status === "accepted") return "accepted";
             if (ack.status === "duplicate" || ack.status === "noop") return ack.status;
             throw new Error(
@@ -3317,15 +3339,19 @@ export function createLocalServices(options: {
             ensureTaskIndexed(target);
             await zcodeAgentService.ensureSessionReady(sessionTargetOf(target));
             // v4 compact 是非 CAS 输入型命令（idle 立即执行 / busy 进 FIFO），无需 baseRevision。
-            const ack = await zcodeAgentService.sendConversationCommandV4({
-              workspacePath: target.workspacePath,
-              ...(target.workspaceIdentity ? { workspaceIdentity: target.workspaceIdentity } : {}),
-              envelope: createHostCommandEnvelope({
-                type: "compact",
-                payload: {},
-                sessionId: target.taskId,
+            const ack = await sendAfterRuntimeReady(() =>
+              zcodeAgentService.sendConversationCommandV4({
+                workspacePath: target.workspacePath,
+                ...(target.workspaceIdentity
+                  ? { workspaceIdentity: target.workspaceIdentity }
+                  : {}),
+                envelope: createHostCommandEnvelope({
+                  type: "compact",
+                  payload: {},
+                  sessionId: target.taskId,
+                }),
               }),
-            });
+            );
             quotaWatchdogLogger.info("context compact command ack", {
               taskId: target.taskId,
               status: ack.status,
@@ -3415,6 +3441,14 @@ export function createLocalServices(options: {
         });
         // 用户手动输入 → 取消在途自动续跑意图（后接线，见上方 ref 声明处注释）。
         quotaWatchdogUserCancelRef.current = quotaWatchdog.cancelAutoResume.bind(quotaWatchdog);
+        // 同一规则的 v4 命令总入口（withManualInputCancel）：桌面 composer、手机/远端、Bot 的输入都直接走
+        // sendConversationCommandV4，不经过 zcodeTaskService.sendPrompt。实机（v4.0.0-watchdog.3 首启）：
+        // 用户在会话里手动发消息后，该会话的旧意图仍是 pending、从未取消，只靠"任务在活动"推迟。
+        // 最后装入、包在最外层：worktree 守卫与连接作用域照常在其内层生效；各调用方都按属性名动态取方法。
+        zcodeAgentService.sendConversationCommandV4 = withManualInputCancel(
+          zcodeAgentService.sendConversationCommandV4.bind(zcodeAgentService),
+          (taskId) => quotaWatchdog.cancelAutoResume({ taskId, reason: "user_manual_input" }),
+        );
         quotaWatchdogFailureRef.current = (event) => {
           void quotaWatchdog.handleSessionFailure({
             taskId: event.target.sessionId,

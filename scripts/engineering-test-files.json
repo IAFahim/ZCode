@@ -184,5 +184,6 @@
   "scripts/preinstalled-tools/catalog.test.ts",
   "scripts/test/audit-conversation-session-json-out.test.mjs",
   "packages/desktop/test/quotaWatchdogService.test.ts",
-  "packages/desktop/test/autoCompactPolicySync.test.ts"
+  "packages/desktop/test/autoCompactPolicySync.test.ts",
+  "packages/desktop/test/quotaResumeCommandGuard.test.ts"
 ]

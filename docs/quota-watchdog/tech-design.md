@@ -427,3 +427,34 @@ interface QuotaResumeDispatchPort {
 **验证边界**：以上行为由单测覆盖（规则 37 + 端到端 20 + 意图仓库 17），端到端用例用真实 sqlite 仓库、
 假 usage / 假派发 port 与可控时钟；真实额度中断、真实 `/use` 核销与 UI → Host → CLI 的策略下发
 未在运行中的应用里触发验证。
+
+## 15. v3.1 实施修订（2026-11-27）
+
+对应 spec §11。新增纯函数模块 `usage-stats/quotaResumeCommandGuard.ts`（无 IO，`sleep` 可注入；
+`node.ts` 再导出供测试），宿主 `node.ts` 只做两处装配：
+
+| 导出 | 职责 |
+| --- | --- |
+| `isRuntimeInitializingRejection(ack)` | `rejected` + `guard.runtimeInitializing` |
+| `sendAfterRuntimeReady(send, { retryDelayMs, maxRetries, sleep? })` | 只对该拒绝码按 1s × 30 次原样重发，返回最后一次 ack；其它 ack 与抛错不重试 |
+| `isManualTextInput(envelope)` | 带会话的 `sendText` 且无 `automationId` / `offPeakTaskId` / `resumeIntentId` |
+| `withManualInputCancel(send, cancel)` | ack 为 `accepted` 的手动输入 → `cancel(sessionId)`；取消失败不改变命令裁决 |
+
+**装配（`node.ts`）**：
+
+- resume port 的 `sendResumeText` / `requestCompact`：`sendConversationCommandV4` 调用包
+  `sendAfterRuntimeReady`。重发发生在 `ensureSessionReady` 之后，会话已激活，不会对冷会话建出空
+  publisher；守卫拒绝是 `remember:false`，同一 `commandId` 重发不会被 inbox 去重吞掉。
+- 看门狗构造之后：`zcodeAgentService.sendConversationCommandV4 = withManualInputCancel(<原方法>.bind(service),
+  (taskId) => quotaWatchdog.cancelAutoResume({ taskId, reason: "user_manual_input" }))`。最后装入、
+  包在最外层：工厂内的 worktree 删除守卫（`runSessionOperation`）在其内层；连接作用域
+  （`base.sendConversationCommandV4(…)`）、task adapter、app-control、Bot、task index syncer 都按
+  属性名在调用时取方法，一处装配覆盖全部宿主侧入口。adapter 的 `onManualPromptSubmitted` 钩子保留。
+
+**已知边界**：派发在 tick 内串行 `await`，冷会话的就绪等待（至多约 30 秒）会推迟同一 tick 里其它
+任务的派发；runtime 始终不就绪时触顶后回到 30 秒派发阶梯，与 v3 行为相同。就绪瞬间与用户手动输入
+并发时，两者仍由 CommandInbox 的 admission 顺序仲裁（先接纳者胜）。
+
+**已证伪假设（v3.1）**：`ensureSessionReady` 返回即代表 v4 发布链 ready（不代表，冷会话紧随其后
+的命令会被守卫拒绝）；用户手动输入都经过 `zcodeTaskService.sendPrompt`（桌面 composer、手机 / 远端、
+Bot 直接走 `sendConversationCommandV4`）。

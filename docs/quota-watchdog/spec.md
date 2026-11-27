@@ -345,6 +345,7 @@ quota 意图派发前必须过 live 快照证实：
   不重复派发）；不在跑才按失败结算。
 - 用户手动 prompt（无后台归因的 sendPrompt）经 adapter `onManualPromptSubmitted` 钩子触发
   `cancelAutoResume`（§3.4 规则落地；v1 未接线）。看门狗自发 compact / 续跑派发不触发。
+  v3.1 起同一规则另在 v4 命令总入口生效（§11.2）：桌面 composer / 手机 / Bot 不经 `sendPrompt`。
 - renderer 失败上报不再推进 attempt（`incrementAttempt: false`）；attempt 由派发结算路径
   统一 +1（v1 双路径各 +1，且并发下 UNIQUE 崩溃后计数归零，上限永不生效）。
 - 同 task 失败上报/结算经 `withTaskLock` 串行化；init 恢复两步各自收错。
@@ -439,12 +440,12 @@ attempt 只由本结算路径推进；detector / renderer 上报不推进 attemp
   结局与失败都无人观察。
 - 派发前 `ensureSessionReady`（重启后的后台任务是冷会话），再发 v4 `sendText`
   （`commandId = inputId`）；**先订阅结局再派发**（额度未恢复时 turn 会在派发调用返回前就失败）；
-  ACK 不是 `accepted` 即按派发失败处理。
+  ACK 不是 `accepted` 即按派发失败处理（`guard.runtimeInitializing` 例外：原地重发，见 §11.1）。
 - 启动看护：ACK 已接受但 45 秒后索引仍明确为空闲 → 按派发失败处理，不空等结局超时。
 - 结局等待 60 分钟；到期仍在跑则续等（至多 8 次），**在途期间绝不重复派发**。
 - 派发本身失败（会话无法恢复 / 命令被拒 / turn 未启动）：30 秒后重试，不计 attempt；连续 10 次
   即 `exhausted`。任何一步失败都不会让行停在 `dispatched`。
-- 结局完成 → 意图删除；用户手动发送消息 → 意图取消（§3.4）。
+- 结局完成 → 意图删除；用户手动发送消息 → 意图取消（§3.4；v3.1 起在 v4 命令总入口生效，见 §11.2）。
 - 续跑文案明确"已完成则不要重做"：意图可能早于用户手动续跑，迟到的续跑只回一行说明。
 
 ### 10.6 context 溢出：先压缩再续跑
@@ -473,3 +474,44 @@ attempt 只由本结算路径推进；detector / renderer 上报不推进 attemp
 - 同一失败由 detector 与结局通道同时上报：只结算一次，attempt 恰好推进一次。
 - 续跑 turn 运行 30 分钟后仍正常：不重复派发；结局超时只在索引明确空闲时才按失败结算。
 - SessionPane 重新挂载重报 2 分钟前的旧错误：不建意图。
+
+## 11. v3.1 修订（2026-11-27：runtime 未就绪原地重发、手动输入取消下沉到 v4 命令入口）
+
+v4.0.0-watchdog.3 首启实机暴露的两处接线缺陷。状态机、数据模型与 schema 均不变。
+
+### 11.1 冷会话的 `guard.runtimeInitializing`：原地重发，不进派发失败阶梯
+
+- **现象**：重启后对冷会话的首次续跑被 bootstrap v4 网关守卫拒绝（`guard.runtimeInitializing`），
+  派发失败计数 +1、30 秒后才重试。`ensureSessionReady` 只保证 runtime 已激活，v4 发布链此时未必
+  ready（实机：启动后半分钟内的两次续跑被拒，要等派发重试才成功）。
+- **规则**：守卫拒绝在 inbox `decide()` 里是 `remember:false`（不记入去重），同一 `commandId` 原样
+  重发即可。派发 port 的 `sendResumeText` 与 `requestCompact` 对该拒绝码按 1 秒间隔重发，至多
+  30 次（约 30 秒）；等待期间不占用意图的派发失败计数。
+- **有界**：其它 `rejected` / `stale` 不重试；`guard.runtimeInitializationFailed` 是终态，立即按
+  派发失败处理；重试触顶同样交还最后一次 ack，走 §10.5 的 30 秒阶梯（与 v3 行为一致）。
+- **副作用边界**：重发只发生在 `ensureSessionReady` 之后（会话已激活、publisher 已存在），不会
+  对冷会话建出空 publisher。压缩请求同理——否则冷会话的两次守卫拒绝会被 §10.6 记成"压缩请求
+  连续被拒"而提前放行续跑。
+
+### 11.2 手动输入即取消：下沉到 v4 命令总入口
+
+- **现象**：桌面 composer、手机 / 远端、Bot 的输入直接走 `zcodeAgentService.sendConversationCommandV4`，
+  不经 `zcodeTaskService.sendPrompt`——§9.5 的 `onManualPromptSubmitted` 钩子只覆盖定时任务与
+  闲时任务派发。用户手动发消息后旧意图仍是 pending，只靠 §10.5 的"任务在活动 → +60s 重排"兜底；
+  用户那一轮一结束，看门狗就会再注入一条续跑。
+- **规则**：`sendConversationCommandV4` 最外层包一层"被接纳的手动输入即取消"——ack 为 `accepted`
+  且命令是**无后台归因的带会话 `sendText`**（无 `automationId` / `offPeakTaskId` / `resumeIntentId`，
+  与 adapter 钩子同一判定），即取消该会话在途的自动续跑意图（`user_manual_input`）。被拒绝 / 过期
+  的输入没有开新一轮，不取消，续跑照常。
+- **覆盖面**：桌面 composer、手机 / 远端、Bot 三条入口一次覆盖。adapter 钩子保留（legacy
+  `sendPrompt` 路径仍走它）；取消幂等，两条路径先后触发无副作用。
+- 续跑自身（带 `resumeIntentId`）与其它命令类型不触发取消。
+
+### 11.3 验收补充
+
+- 冷会话前两次命令被 `guard.runtimeInitializing` 拒绝、第三次接纳：意图直接 `dispatched`，
+  `lastError` 不含 `dispatch failed`，结局等待恰好一条。
+- 一直被拒：重试触顶后意图回到 pending，`nextEligibleAt = now + 30s`，不无限等待。
+- `guard.runtimeInitializationFailed`：只发一次，立即按派发失败处理。
+- 用户在有待续跑意图的会话里手动发消息且被接纳：意图 `cancelled`，之后的 tick 不再派发。
+- 其它会话的手动输入不影响本会话的意图；自动续跑自己的 `sendText` 不触发取消。
